@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config \
+            build-essential file curl xz-utils
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      # tauri::generate_context! embeds ../dist, so the frontend must exist before cargo runs.
+      - run: npm run build
+
+      # Frontend logic without a DOM; Node 22.18+ strips the TypeScript types.
+      - run: node --test "tests/unit/*.test.mjs"
+
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
+
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+  audit:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - run: npm audit --omit=dev
+
+      - run: cargo audit --file src-tauri/Cargo.lock
+
+      - run: cargo deny --manifest-path src-tauri/Cargo.toml --locked check
+
+  e2e:
+    name: E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # src-tauri/tauri.linux.conf.json renames the Linux binary.
+          - os: ubuntu-22.04
+            binary: notebook-vault
+          - os: windows-latest
+            binary: notebook.exe
+    env:
+      # Release profile, so release-only code (hardening, panic=abort, LTO) is exercised.
+      NOTEBOOK_E2E_APP: ${{ github.workspace }}/src-tauri/target/release/${{ matrix.binary }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config \
+            build-essential file curl xz-utils dbus webkit2gtk-driver xvfb
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - run: npm run tauri -- build --no-bundle -- --locked
+
+      - run: cargo install tauri-driver --locked
+
+      # tauri-driver needs an Edge WebDriver whose version matches the installed
+      # WebView2 runtime; msedgedriver-tool is the tool the Tauri WebDriver CI guide uses.
+      - name: Install msedgedriver matching WebView2
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo install --locked --git https://github.com/chippers/msedgedriver-tool --rev 8c4b34f51b45f5cf08013366d703de464ab871d1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dir = Join-Path $env:RUNNER_TEMP 'msedgedriver'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Push-Location $dir
+          msedgedriver-tool
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # A private session bus ends with the run, so no app-launched dbus-daemon outlives it.
+      - name: Run end-to-end tests (Linux)
+        if: runner.os == 'Linux'
+        run: dbus-run-session -- xvfb-run -a npm run test:e2e
+
+      - name: Run end-to-end tests (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:e2e

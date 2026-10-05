@@ -1,0 +1,158 @@
+[default]
+description = "No commands are granted by default."
+permissions = []
+
+[[permission]]
+identifier = "allow-config-get"
+description = "Read the preferences and the active workspace's non-secret configuration."
+commands.allow = ["config_get"]
+
+[[permission]]
+identifier = "allow-workspaces-list"
+description = "List the workspaces (names, S3 locations, whether secrets are stored) and the active one."
+commands.allow = ["workspaces_list"]
+
+[[permission]]
+identifier = "allow-workspace-save"
+description = "Create or edit a workspace; credentials and phrase are sealed in secrets.json."
+commands.allow = ["workspace_save"]
+
+[[permission]]
+identifier = "allow-workspace-delete"
+description = "Delete a locked workspace and its sealed secrets; S3 objects and queued edits stay."
+commands.allow = ["workspace_delete"]
+
+[[permission]]
+identifier = "allow-workspace-select"
+description = "End the current session and make another workspace the active one."
+commands.allow = ["workspace_select"]
+
+[[permission]]
+identifier = "allow-settings-set"
+description = "Update the global theme, accent and auto-lock preferences."
+commands.allow = ["settings_set"]
+
+[[permission]]
+identifier = "allow-layout-set"
+description = "Save the sidebar and outline widths and the Split ratio with the global preferences."
+commands.allow = ["layout_set"]
+
+[[permission]]
+identifier = "allow-connection-test"
+description = "Test the configured S3 index object."
+commands.allow = ["connection_test"]
+
+[[permission]]
+identifier = "allow-vault-unlock"
+description = "Unlock the active workspace with a typed or remembered phrase, remembering or forgetting it."
+commands.allow = ["vault_unlock"]
+
+[[permission]]
+identifier = "allow-vault-lock"
+description = "Flush and lock the vault."
+commands.allow = ["vault_lock"]
+
+[[permission]]
+identifier = "allow-passphrase-change"
+description = "Rewrap the vault key with a new passphrase."
+commands.allow = ["passphrase_change"]
+
+[[permission]]
+identifier = "allow-activity-ping"
+description = "Reset the in-memory idle-lock timer."
+commands.allow = ["activity_ping"]
+
+[[permission]]
+identifier = "allow-tree-get"
+description = "Read the unlocked in-memory tree."
+commands.allow = ["tree_get"]
+
+[[permission]]
+identifier = "allow-folder-create"
+description = "Create a virtual folder."
+commands.allow = ["folder_create"]
+
+[[permission]]
+identifier = "allow-doc-create"
+description = "Create an encrypted document."
+commands.allow = ["doc_create"]
+
+[[permission]]
+identifier = "allow-node-rename"
+description = "Rename a live virtual node."
+commands.allow = ["node_rename"]
+
+[[permission]]
+identifier = "allow-node-move"
+description = "Move a live virtual node."
+commands.allow = ["node_move"]
+
+[[permission]]
+identifier = "allow-node-trash"
+description = "Move a live node to encrypted-index Trash."
+commands.allow = ["node_trash"]
+
+[[permission]]
+identifier = "allow-trash-restore"
+description = "Restore a Trash entry."
+commands.allow = ["trash_restore"]
+
+[[permission]]
+identifier = "allow-trash-purge"
+description = "Permanently delete selected Trash entries."
+commands.allow = ["trash_purge"]
+
+[[permission]]
+identifier = "allow-trash-empty"
+description = "Permanently delete all Trash entries."
+commands.allow = ["trash_empty"]
+
+[[permission]]
+identifier = "allow-search-titles"
+description = "Search encrypted-index titles in memory."
+commands.allow = ["search_titles"]
+
+[[permission]]
+identifier = "allow-doc-open"
+description = "Open and decrypt a document in memory."
+commands.allow = ["doc_open"]
+
+[[permission]]
+identifier = "allow-doc-stage"
+description = "Write an edit of an open document to the encrypted local outbox."
+commands.allow = ["doc_stage"]
+
+[[permission]]
+identifier = "allow-doc-commit"
+description = "Upload the staged edit of a document to S3."
+commands.allow = ["doc_commit"]
+
+[[permission]]
+identifier = "allow-flush-all"
+description = "Flush pending encrypted writes."
+commands.allow = ["flush_all"]
+
+[[permission]]
+identifier = "allow-image-add"
+description = "Validate, encrypt and add image bytes."
+commands.allow = ["image_add"]
+
+[[permission]]
+identifier = "allow-preview-render"
+description = "Render sanitized preview HTML from Markdown text."
+commands.allow = ["preview_render"]
+
+[[permission]]
+identifier = "allow-link-open"
+description = "Open a validated web or email link in the system browser or mail client."
+commands.allow = ["link_open"]
+
+[[permission]]
+identifier = "allow-close-after-flush"
+description = "Close the main window once a pending close has saved the open document."
+commands.allow = ["close_after_flush"]
+
+[[permission]]
+identifier = "allow-cancel-close"
+description = "Cancel a pending guarded close after a save failure."
+commands.allow = ["cancel_close"]

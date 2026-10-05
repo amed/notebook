@@ -1,0 +1,79 @@
+[package]
+name = "notebook"
+version = "0.1.0"
+description = "Encrypted Markdown notebook backed by your own S3 bucket"
+authors = ["Notebook contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/notebook"
+edition = "2024"
+rust-version = "1.90"
+
+# `notebook_app`, not `notebook`, so the crate root is not confused with its
+# `notebook` command module.
+[lib]
+name = "notebook_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "notebook"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.5.1", default-features = false, features = ["config-json5"] }
+
+[dependencies]
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "getrandom"] }
+aes-gcm-siv = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "getrandom"] }
+ammonia = { version = "4.1.2", default-features = false }
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash", "rand"] }
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+bytes = { version = "1.10.1", default-features = false, features = ["serde"] }
+getrandom = { version = "0.3.3", default-features = false }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+hkdf = { version = "0.12.4", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
+pulldown-cmark = { version = "0.13.0", default-features = false, features = ["html"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls", "system-proxy"] }
+rusty-s3 = { version = "0.10.1", default-features = false, features = ["full", "rustcrypto"] }
+secrecy = { version = "0.10.3", default-features = false, features = ["serde"] }
+serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.143", default-features = false, features = ["std"] }
+sha2 = { version = "0.10.9", default-features = false }
+tauri = { version = "2.12.0", default-features = false, features = ["wry", "common-controls-v6", "compression", "config-json5"] }
+tauri-plugin-opener = { version = "2.7.0", default-features = false }
+thiserror = { version = "2.0.16", default-features = false }
+tokio = { version = "1.47.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = { version = "0.1.41", default-features = false, features = ["attributes", "std"] }
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "smallvec"] }
+unicode-normalization = "0.1.24"
+url = { version = "2.5.7", default-features = false, features = ["serde"] }
+uuid = { version = "1.18.1", default-features = false, features = ["v4", "serde", "std"] }
+zeroize = { version = "1.8.1", default-features = false, features = ["alloc", "derive", "serde"] }
+
+# Best-effort process hygiene (spec section 11): core-dump limit on Unix and the
+# Linux non-dumpable flag. rustix is already in the graph and exposes prctl
+# without unsafe code in this crate.
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", default-features = false, features = ["process", "std"] }
+
+[dev-dependencies]
+proptest = { version = "1.7.0", default-features = false, features = ["std"] }
+tempfile = "3.21.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release.package.argon2]
+opt-level = 3
+
+[profile.release.package.aes-gcm]
+opt-level = 3

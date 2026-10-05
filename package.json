@@ -1,0 +1,36 @@
+{
+  "name": "notebook",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A zero-knowledge encrypted Markdown vault backed by a user-owned S3 bucket.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "build:mac": "bash scripts/build-mac.sh",
+    "test": "npm run check && npm run test:unit && cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:unit": "node --test \"tests/unit/*.test.mjs\"",
+    "test:e2e": "node --test \"tests/e2e/*.test.mjs\"",
+    "audit": "npm audit --omit=dev && cargo audit --file src-tauri/Cargo.lock",
+    "version:set": "node scripts/set-version.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.0",
+    "monaco-editor": "0.57.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.0",
+    "selenium-webdriver": "4.49.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.1"
+  },
+  "overrides": {
+    "dompurify": "3.4.16"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}

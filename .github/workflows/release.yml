@@ -1,0 +1,289 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Verify version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - id: check
+        name: Compare tag with every version field
+        env:
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+          TAG: ${{ github.ref_name }}
+        shell: python3 {0}
+        run: |
+          import json, os, re, sys, tomllib
+
+          def load_json(path):
+              with open(path, encoding="utf-8") as f:
+                  return json.load(f)
+
+          def load_toml(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          package_lock = load_json("package-lock.json")
+          cargo_toml = load_toml("src-tauri/Cargo.toml")
+          crate = cargo_toml["package"]["name"]
+          locked = [p["version"] for p in load_toml("src-tauri/Cargo.lock")["package"] if p["name"] == crate]
+          found = {
+              "package.json": load_json("package.json")["version"],
+              "package-lock.json": package_lock["version"],
+              'package-lock.json packages[""]': package_lock["packages"][""]["version"],
+              "src-tauri/tauri.conf.json": load_json("src-tauri/tauri.conf.json")["version"],
+              "src-tauri/Cargo.toml": cargo_toml["package"]["version"],
+              "src-tauri/Cargo.lock": locked[0] if len(locked) == 1 else None,
+          }
+
+          if os.environ["IS_TAG"] == "true":
+              tag = os.environ["TAG"]
+              expected = tag[1:] if tag.startswith("v") else None
+              subject = f"Tag {tag} is not vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-N"
+          else:
+              expected = found["package.json"]
+              subject = f"package.json version {expected} is not MAJOR.MINOR.PATCH or MAJOR.MINOR.PATCH-N"
+
+          # Same rule as scripts/set-version.mjs: numeric N, and the Windows Installer
+          # field limits, so a bad version fails here instead of late in the MSI step.
+          pattern = r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(0|[1-9]\d*))?"
+          match = re.fullmatch(pattern, expected) if isinstance(expected, str) else None
+          limits = (255, 255, 65535, 65535)
+          if not match or any(v is not None and int(v) > m for v, m in zip(match.groups(), limits)):
+              print(f"::error::{subject} with numeric N, major and minor at most 255, patch and N at most 65535")
+              sys.exit(1)
+
+          wrong = {path: value for path, value in found.items() if value != expected}
+          for path, value in wrong.items():
+              print(f"::error file={path.split()[0]}::{path} has version {value}, expected {expected}")
+          if wrong:
+              print(f"Run `npm run version:set -- {expected}` and commit the result before tagging.")
+              sys.exit(1)
+
+          print(f"All version fields are {expected}.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={expected}\n")
+              out.write(f"prerelease={'true' if '-' in expected else 'false'}\n")
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-universal
+            os: macos-latest
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin -- --locked
+            bundles: |
+              src-tauri/target/**/release/bundle/dmg/*.dmg
+          - platform: windows-x64
+            os: windows-latest
+            rust-targets: ''
+            args: -- --locked
+            bundles: |
+              src-tauri/target/**/release/bundle/msi/*.msi
+              src-tauri/target/**/release/bundle/nsis/*-setup.exe
+          - platform: linux-x64
+            os: ubuntu-22.04
+            rust-targets: ''
+            args: -- --locked
+            bundles: |
+              src-tauri/target/**/release/bundle/appimage/*.AppImage
+              src-tauri/target/**/release/bundle/deb/*.deb
+              src-tauri/target/**/release/bundle/rpm/*.rpm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config \
+            build-essential file curl xz-utils
+
+      # No dependency caches in release builds: every input comes from the lockfiles
+      # (npm ci, and cargo --locked through the matrix args).
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      # Third-party actions in this job see the signing secrets, so they are pinned to commits.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-10-01
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust-targets }}
+
+      - run: npm ci
+
+      # tauri-cli treats an empty APPLE_* variable as set, so only non-empty secrets are exported.
+      - name: Export macOS signing secrets that are set
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          signing=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY)
+          notarization=(APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID)
+          count_set() {
+            local n=0 name
+            for name in "$@"; do
+              if [ -n "${!name:-}" ]; then n=$((n + 1)); fi
+            done
+            echo "$n"
+          }
+          signing_set=$(count_set "${signing[@]}")
+          notarization_set=$(count_set "${notarization[@]}")
+          if [ "$signing_set" -ne 0 ] && [ "$signing_set" -ne 3 ]; then
+            echo "::error::Set all of ${signing[*]} or none of them."
+            exit 1
+          fi
+          if [ "$notarization_set" -ne 0 ] && [ "$notarization_set" -ne 3 ]; then
+            echo "::error::Set all of ${notarization[*]} or none of them."
+            exit 1
+          fi
+          if [ "$notarization_set" -eq 3 ] && [ "$signing_set" -ne 3 ]; then
+            echo "::error::Notarization needs a Developer ID certificate: also set ${signing[*]}."
+            exit 1
+          fi
+          for name in "${signing[@]}" "${notarization[@]}"; do
+            if [ -n "${!name:-}" ]; then
+              delimiter="EOF_$(openssl rand -hex 16)"
+              {
+                echo "$name<<$delimiter"
+                printf '%s\n' "${!name:-}"
+                echo "$delimiter"
+              } >> "$GITHUB_ENV"
+            fi
+          done
+          if [ "$signing_set" -eq 0 ]; then
+            echo "No signing secrets: the app is ad-hoc signed and not notarized."
+          elif [ "$notarization_set" -eq 0 ]; then
+            echo "Developer ID signing enabled; notarization secrets are not set."
+          else
+            echo "Developer ID signing and notarization enabled."
+          fi
+
+      # tagName, releaseName and releaseId stay unset, so tauri-action only builds;
+      # the publish job attaches the installers to the draft release.
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          # tauri-action would otherwise set this to true and run the Finder
+          # AppleScript; keep tauri's CI behavior of skipping it.
+          TAURI_BUNDLER_DMG_IGNORE_CI: 'false'
+        with:
+          args: ${{ matrix.args }}
+          uploadUpdaterJson: false
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notebook-${{ matrix.platform }}
+          path: ${{ matrix.bundles }}
+          if-no-files-found: error
+
+  publish:
+    name: Draft GitHub release
+    needs: [version, build]
+    # A manual run started from a tag still only produces workflow artifacts.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: notebook-*
+          path: downloaded
+          merge-multiple: true
+
+      - name: Create the draft release and attach the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+          MAC_SIGNED: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          MAC_NOTARIZED: ${{ secrets.APPLE_ID != '' }}
+        run: |
+          set -euo pipefail
+          mkdir release
+          # GitHub turns spaces in asset names into dots; do it here so SHA256SUMS.txt matches.
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            cp "$file" "release/${name// /.}"
+          done < <(find downloaded -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*-setup.exe' \
+            -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -print0)
+          for pattern in '*.dmg' '*.msi' '*-setup.exe' '*.AppImage' '*.deb' '*.rpm'; do
+            if ! compgen -G "release/$pattern" > /dev/null; then
+              echo "::error::No $pattern installer was downloaded."
+              exit 1
+            fi
+          done
+          (cd release && sha256sum -- * > ../SHA256SUMS.txt)
+          mv SHA256SUMS.txt release/
+          ls -l release
+
+          if [ "$MAC_SIGNED" != true ]; then
+            mac="ad-hoc signed, not notarized"
+          elif [ "$MAC_NOTARIZED" != true ]; then
+            mac="Developer ID signed, not notarized"
+          else
+            mac="Developer ID signed and notarized"
+          fi
+          cat > notes.md <<EOF
+          Built by the Release workflow from \`$TAG\` ($GITHUB_SHA).
+
+          - macOS 11+: universal \`.dmg\` ($mac)
+          - Windows x64: \`.msi\` and NSIS \`-setup.exe\` (not code-signed)
+          - Linux x64: \`.AppImage\`, \`.deb\`, \`.rpm\`
+
+          SHA-256 checksums are in \`SHA256SUMS.txt\`.
+          EOF
+
+          if is_draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$is_draft" != true ]; then
+              echo "::error::Release $TAG is already published; not changing it."
+              exit 1
+            fi
+            echo "Draft release $TAG exists; replacing its assets."
+            gh release upload "$TAG" release/* --clobber
+          else
+            flags=(--draft --verify-tag --title "Notebook v$VERSION" --notes-file notes.md)
+            if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+            gh release create "$TAG" release/* "${flags[@]}"
+          fi

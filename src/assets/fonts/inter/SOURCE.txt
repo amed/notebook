@@ -1,0 +1,5 @@
+Inter (variable, wght axis 100-900), normal + italic, woff2, split by unicode range.
+Source: npm package @fontsource-variable/inter 5.3.0 (files/inter-*-wght-*.woff2),
+built from https://github.com/rsms/inter via Google Fonts (font version v20).
+Copyright 2016 The Inter Project Authors. Licensed under the SIL Open Font License 1.1, see OFL.txt.
+Referenced only by the @font-face rules at the top of src/theme.css.

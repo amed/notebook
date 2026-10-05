@@ -1,0 +1,350 @@
+import { invoke } from "@tauri-apps/api/core";
+import { type PanelLayout, type PanelLayoutWire, layoutFromWire } from "./panel-layout";
+import { type Accent, DEFAULT_ACCENT, isAccent } from "./theme";
+import { workspacePayload } from "./workspaces";
+
+export type ThemePreference = "System" | "Light" | "Dark";
+
+/** `config_get`: the global preferences and the active workspace (if any). */
+export interface VaultConfig {
+  workspace_id?: string | null;
+  workspace_name?: string | null;
+  bucket: string;
+  region: string;
+  prefix: string;
+  endpoint?: string | null;
+  auto_lock_minutes: number;
+  theme: ThemePreference;
+  accent: Accent;
+  /** Pane sizes; configs written before them get the defaults. */
+  layout: PanelLayout;
+  credentials_stored: boolean;
+  /** The active workspace's encryption phrase is remembered on this device. */
+  phrase_stored?: boolean;
+  masked_access_key_id?: string | null;
+}
+
+/** A named S3 location. Secrets are reported only as stored or not. */
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  bucket: string;
+  region: string;
+  prefix: string;
+  endpoint: string | null;
+  credentials_stored: boolean;
+  phrase_stored: boolean;
+  /** Remember was last unchecked for this workspace: the unlock screen offers it unchecked. */
+  remember_declined: boolean;
+  masked_access_key_id: string | null;
+}
+
+/** `workspaces_list`: the workspaces in name order and the active id. */
+export interface WorkspaceList {
+  workspaces: WorkspaceSummary[];
+  active: string | null;
+}
+
+/**
+ * `workspace_save`: without `id` a workspace is created (the first one becomes
+ * active). An absent `credentials` or `phrase` keeps what is stored;
+ * `remember_phrase: false` forgets the stored phrase. `leave_pending` saves a
+ * new location although edits queued at the old one are not uploaded yet
+ * (otherwise `OUTBOX_PENDING`).
+ */
+export interface WorkspaceInput {
+  id?: string;
+  name: string;
+  bucket: string;
+  region: string;
+  prefix: string;
+  endpoint?: string | null;
+  credentials?: CredentialsInput;
+  phrase?: string;
+  remember_phrase?: boolean;
+  leave_pending?: boolean;
+}
+
+export interface CredentialsInput {
+  access_key_id: string;
+  secret_access_key: string;
+  session_token?: string | null;
+}
+
+export type ConnectionResult =
+  | "VaultFound"
+  | "NoVault"
+  | "AccessDenied"
+  | "Unreachable";
+
+export type NodeKindName =
+  | "Root"
+  | "Trash"
+  | "Folder"
+  | "Document"
+  | "TrashEntry"
+  | "TrashOrigin";
+
+/** A Trash entry as Notebook lists it. Paths are workspace-relative. */
+export interface OriginSummary {
+  name: string;
+  original_path: string;
+  /** The original parent folder; "" is the workspace root. */
+  location: string;
+  /** Unix milliseconds; null when unknown (entries of earlier builds). */
+  deleted_at: number | null;
+  item_kind: "Folder" | "Document";
+  /** Notebook's "N items": every file and folder below a deleted folder. */
+  item_count: number;
+  doc_count: number;
+  folder_count: number;
+  image_count: number;
+  legacy: boolean;
+}
+
+/** Ids derive from kind and path: a renamed or moved item is a new node. */
+export interface TreeNode {
+  id: string;
+  parent: string | null;
+  name: string;
+  kind: NodeKindName | Record<string, unknown>;
+  origin?: OriginSummary | null;
+  trash_entry_id?: string | null;
+}
+
+export interface TreeSnapshot {
+  nodes: TreeNode[];
+  root_id?: string;
+  trash_id?: string;
+  /** The tree version; a delta applies only to the version it starts from. */
+  version?: number;
+}
+
+/** A change's effect on the tree: version `from` becomes `to`. */
+export interface TreeDelta {
+  from: number;
+  to: number;
+  upsert: TreeNode[];
+  remove: string[];
+}
+
+export interface CreatedNode {
+  id: string;
+  final_name?: string;
+  tree?: TreeDelta;
+}
+
+export interface TrashResult {
+  entry_id: string;
+  tree?: TreeDelta;
+}
+
+export interface RestoreResult {
+  restored_id?: string;
+  final_name?: string;
+  final_path?: string;
+  tree?: TreeDelta;
+}
+
+export interface PurgeResult {
+  documents: number;
+  folders: number;
+  images: number;
+  tree?: TreeDelta;
+}
+
+/** "Original" restores to the original path; `To` names a folder id. */
+export type RestoreMode = "Original" | { To: string };
+
+export interface OpenDocument {
+  text: string;
+  rev: number;
+  read_only: boolean;
+  rollback_warning: boolean;
+  /** The text is an edit from the local outbox that S3 does not hold yet. */
+  dirty: boolean;
+}
+
+export interface SaveResult {
+  status: "Saved" | "Offline" | "ConflictCopy";
+  document_id?: string | null;
+  /** A conflict copy joined the tree. */
+  tree?: TreeDelta;
+}
+
+export interface PassphraseChangeResult {
+  cleanup_pending: boolean;
+}
+
+export interface IpcFailure {
+  code: string;
+  message: string;
+}
+
+function optionalString(value: string): string | null {
+  const clean = value.trim();
+  return clean.length > 0 ? clean : null;
+}
+
+export function normalizeConfig(raw: Omit<VaultConfig, "layout"> & { layout?: unknown }): VaultConfig {
+  const record = raw as VaultConfig & {
+    autoLockMinutes?: number;
+    credentialsStored?: boolean;
+    maskedAccessKeyId?: string | null;
+  };
+  return {
+    workspace_id: raw.workspace_id ?? null,
+    workspace_name: raw.workspace_name ?? null,
+    bucket: raw.bucket ?? "",
+    region: raw.region ?? "",
+    prefix: raw.prefix ?? "",
+    endpoint: raw.endpoint ?? null,
+    auto_lock_minutes: raw.auto_lock_minutes ?? record.autoLockMinutes ?? 15,
+    theme: raw.theme ?? "System",
+    accent: isAccent(raw.accent) ? raw.accent : DEFAULT_ACCENT,
+    layout: layoutFromWire(raw.layout),
+    credentials_stored:
+      raw.credentials_stored ?? record.credentialsStored ?? false,
+    phrase_stored: raw.phrase_stored ?? false,
+    masked_access_key_id:
+      raw.masked_access_key_id ?? record.maskedAccessKeyId ?? null,
+  };
+}
+
+export function normalizeSnapshot(raw: TreeSnapshot | TreeNode[]): TreeSnapshot {
+  return Array.isArray(raw) ? { nodes: raw } : raw;
+}
+
+export function kindName(node: TreeNode): NodeKindName {
+  if (typeof node.kind === "string") return node.kind;
+  const first = Object.keys(node.kind)[0];
+  return (first as NodeKindName | undefined) ?? "Document";
+}
+
+export function isIpcFailure(value: unknown): value is IpcFailure {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.code === "string" && typeof record.message === "string";
+}
+
+export function errorCode(value: unknown): string {
+  if (isIpcFailure(value)) return value.code;
+  if (typeof value === "object" && value !== null) {
+    const code = (value as Record<string, unknown>).code;
+    if (typeof code === "string") return code;
+  }
+  return "UNKNOWN";
+}
+
+/** Only backend-declared safe messages are shown. Arbitrary thrown values are hidden. */
+export function safeErrorMessage(
+  value: unknown,
+  fallback = "The operation could not be completed.",
+): string {
+  if (isIpcFailure(value) && value.message.trim().length > 0) {
+    return value.message;
+  }
+  if (typeof value === "object" && value !== null) {
+    const message = (value as Record<string, unknown>).message;
+    if (typeof message === "string" && message.length <= 240) return message;
+  }
+  return fallback;
+}
+
+export const ipc = {
+  configGet: async (): Promise<VaultConfig> =>
+    normalizeConfig(await invoke<Omit<VaultConfig, "layout"> & { layout?: unknown }>("config_get")),
+
+  /** Pane sizes, saved with the global preferences; never an S3 request. */
+  layoutSet: async (layout: PanelLayoutWire): Promise<void> => invoke("layout_set", { ...layout }),
+
+  settingsSet: async (
+    autoLockMinutes: number,
+    theme: ThemePreference,
+    accent: Accent,
+  ): Promise<void> => invoke("settings_set", { autoLockMinutes, theme, accent }),
+
+  connectionTest: async (): Promise<ConnectionResult> =>
+    invoke<ConnectionResult>("connection_test"),
+
+  /**
+   * Without `passphrase` the remembered phrase is used (`NO_STORED_PHRASE` when
+   * none). `remember: true` stores a typed phrase after a successful unlock,
+   * `false` forgets the stored one, absent leaves it as it is.
+   */
+  vaultUnlock: async (passphrase?: string | null, remember?: boolean): Promise<TreeSnapshot> =>
+    normalizeSnapshot(
+      await invoke<TreeSnapshot | TreeNode[]>("vault_unlock", {
+        passphrase: passphrase ?? null,
+        remember: remember ?? null,
+      }),
+    ),
+
+  workspacesList: async (): Promise<WorkspaceList> => invoke<WorkspaceList>("workspaces_list"),
+  workspaceSave: async (input: WorkspaceInput): Promise<WorkspaceSummary> =>
+    invoke<WorkspaceSummary>("workspace_save", { workspace: workspacePayload(input) }),
+  /**
+   * Refused (`WORKSPACE_UNLOCKED`) for the active workspace while unlocked, and
+   * (`OUTBOX_PENDING`) while edits queued for its location are not uploaded,
+   * unless `leavePending` keeps them on this device.
+   */
+  workspaceDelete: async (id: string, leavePending = false): Promise<WorkspaceList> =>
+    invoke<WorkspaceList>("workspace_delete", { id, leavePending }),
+  /** Ends the current session: flush the open document first. */
+  workspaceSelect: async (id: string): Promise<WorkspaceSummary> =>
+    invoke<WorkspaceSummary>("workspace_select", { id }),
+
+  vaultLock: async (): Promise<void> => invoke("vault_lock"),
+  passphraseChange: async (
+    oldPassphrase: string,
+    newPassphrase: string,
+  ): Promise<PassphraseChangeResult> =>
+    invoke("passphrase_change", { oldPassphrase, newPassphrase }),
+  activityPing: async (): Promise<void> => invoke("activity_ping"),
+
+  /** `relist`: list S3 again (the Refresh button); otherwise the session's own tree, no request. */
+  treeGet: async (relist: boolean): Promise<TreeSnapshot> =>
+    normalizeSnapshot(await invoke<TreeSnapshot | TreeNode[]>("tree_get", { relist })),
+
+  folderCreate: async (parentId: string, name?: string): Promise<CreatedNode> =>
+    invoke("folder_create", { parentId, name: name ? optionalString(name) : null }),
+  /** One parallel round: the document, plus a marker per missing folder in `folders`. */
+  docCreate: async (parentId: string, name?: string, text?: string, folders: string[] = []): Promise<CreatedNode> =>
+    invoke("doc_create", { parentId, name: name ? optionalString(name) : null, text: text ?? null, folders }),
+  /** Ids follow the path, so the renamed or moved item has the returned id. */
+  nodeRename: async (id: string, name: string): Promise<CreatedNode> =>
+    invoke("node_rename", { id, name }),
+  nodeMove: async (id: string, newParentId: string): Promise<CreatedNode> =>
+    invoke("node_move", { id, newParentId }),
+  nodeTrash: async (id: string): Promise<TrashResult> => invoke("node_trash", { id }),
+
+  trashRestore: async (
+    entryId: string,
+    mode: RestoreMode,
+    name?: string,
+  ): Promise<RestoreResult> =>
+    invoke("trash_restore", { entryId, mode, name: name ?? null }),
+  trashPurge: async (entryIds: string[]): Promise<PurgeResult> =>
+    invoke("trash_purge", { entryIds }),
+  trashEmpty: async (): Promise<PurgeResult> => invoke("trash_empty"),
+
+  searchTitles: async (query: string, includeTrash: boolean): Promise<string[]> =>
+    invoke("search_titles", { query, includeTrash }),
+  docOpen: async (id: string): Promise<OpenDocument> => invoke("doc_open", { id }),
+  /** Writes the edit to the encrypted local outbox; no S3 request. */
+  docStage: async (id: string, text: string): Promise<"Clean" | "Staged"> =>
+    invoke("doc_stage", { id, text }),
+  /** Uploads the staged edit, if any (otherwise no S3 request). */
+  docCommit: async (id: string): Promise<SaveResult> => invoke("doc_commit", { id }),
+  /** Uploads every staged edit and any outbox entry left from earlier. */
+  flushAll: async (): Promise<void> => invoke("flush_all"),
+
+  imageAdd: async (bytes: Uint8Array, filename: string): Promise<string> =>
+    invoke("image_add", { bytes, filename }),
+  previewRender: async (text: string): Promise<string> =>
+    invoke<string>("preview_render", { text }),
+  linkOpen: async (url: string): Promise<void> => invoke("link_open", { url }),
+  /** Ends a close that waited for the open document to be saved. */
+  closeAfterFlush: async (): Promise<void> => invoke("close_after_flush"),
+  cancelClose: async (): Promise<void> => invoke("cancel_close"),
+};

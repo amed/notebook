@@ -1,0 +1,73 @@
+# cargo-deny policy (spec section 16, "Security checks").
+# Run: cargo deny --manifest-path src-tauri/Cargo.toml --locked check
+
+[graph]
+# Every target the release workflow ships, so platform-only crates are checked too.
+# Known gap: cargo-deny 0.20.2 drops keyring's macOS backend (security-framework 3.x,
+# security-framework-sys) from the graph, so bans/licenses/advisories never see it;
+# `cargo audit --file src-tauri/Cargo.lock` covers its advisories and must stay a
+# required CI step.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+# Vulnerability advisories always fail. Unmaintained and unsound advisories fail for
+# every crate in the graph unless listed in ignore with a reason.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 is a build-time proc macro pulled in by gtk-rs 0.18 glib-macros/gtk3-macros via Tauri on Linux; no maintained replacement until Tauri moves off gtk3" },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18 VariantStrIter is unsound; Linux-only via tauri/wry/tao (gtk3 0.18), fixed only in glib >= 0.20 which Tauri 2 cannot use, and nothing in the graph calls Variant::array_iter_str" },
+]
+
+[licenses]
+# Permissive licenses only. Some entries are not used by today's graph; they are
+# allowed so a new permissive dependency does not need a policy change.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+# MPL-2.0 is file-level copyleft; allowed only for these unmodified transitive crates
+# (Tauri's HTML parsing, and option-ext via dirs).
+exceptions = [
+    { crate = "cssparser", allow = ["MPL-2.0"] },
+    { crate = "cssparser-macros", allow = ["MPL-2.0"] },
+    { crate = "dtoa-short", allow = ["MPL-2.0"] },
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+    { crate = "selectors", allow = ["MPL-2.0"] },
+]
+
+[bans]
+# Duplicates come from Tauri, gtk-rs and RustCrypto version splits we cannot unify.
+multiple-versions = "allow"
+wildcards = "deny"
+deny = [
+    { crate = "openssl", reason = "TLS is rustls only (spec section 2)" },
+    { crate = "openssl-sys", reason = "TLS is rustls only (spec section 2)" },
+    { crate = "native-tls", reason = "TLS is rustls only (spec section 2)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
