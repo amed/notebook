@@ -1,7 +1,7 @@
 // Run with `node --test tests/unit/` (Node 22.18+ strips the TypeScript types).
 // Scenarios (a) to (c) are the wrong-document saves found in review; the rest
-// cover the save model: outbox ("stage") within a second, S3 ("commit") on
-// Cmd+S, switch, idle, exit and retries.
+// cover the save model: outbox ("stage") within a second (5 s for texts over
+// 2 Mi characters), S3 ("commit") on Cmd+S, switch, idle, exit and retries.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DocumentSession } from "../../src/documents.ts";
@@ -197,6 +197,46 @@ test("a trashed open document drops its pending edit", async (t) => {
   assert.deepEqual(calls, ["open A"]);
 });
 
+test("a document handed to another window is never uploaded or retried from here", async (t) => {
+  const { session, open, tick, journal, calls, states, failing } = harness(t, { A: "alpha", B: "beta" });
+  await open("A");
+  session.edited("alpha EDITED");
+  // Open in new window: the edit reaches the outbox first, then A belongs to that window.
+  assert.equal(await session.persist(), true);
+  assert.equal(journal.get("A"), "alpha EDITED");
+  failing.add("A");
+  session.handOff("A");
+  calls.length = 0;
+  await tick(10 * 60_000);
+  assert.deepEqual(calls, [], "no upload, no retry");
+  assert.equal(await session.save(), true);
+  await session.syncNow();
+  assert.deepEqual(calls, []);
+  assert.equal(states.at(-1), "clean");
+  assert.equal(session.openId, "A", "the editor keeps showing it, read-only");
+  // Switching away uploads nothing of A either.
+  await open("B");
+  await settle();
+  assert.deepEqual(calls, ["open B"]);
+});
+
+test("a document another window writes opens read-only and is never uploaded from here", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const calls = [];
+  const states = [];
+  const session = new DocumentSession({
+    open: async (id) => { calls.push(`open ${id}`); return { text: "staged there", readOnly: true, dirty: true }; },
+    stage: async (id) => { calls.push(`stage ${id}`); return "Staged"; },
+    commit: async (id) => { calls.push(`commit ${id}`); return { status: "Saved" }; },
+  }, { state: (state) => states.push(state) });
+  await session.open("A", () => {});
+  t.mock.timers.tick(10 * 60_000);
+  await settle();
+  assert.equal(await session.save(), true);
+  assert.deepEqual(calls, ["open A"]);
+  assert.deepEqual(states, [], "stays clean");
+});
+
 test("lock writes the outbox first, and an open still loading never shows afterwards", async (t) => {
   const { session, open, hold, uploads, shown } = harness(t, { A: "alpha" });
   await open("A");
@@ -258,6 +298,75 @@ test("typing writes the outbox after a 1 s pause and uploads after 30 s idle", a
   assert.deepEqual(calls, ["stage A", "commit A"]);
   assert.deepEqual(uploads, [["A", "alpha 35"]]);
   assert.deepEqual(states, ["dirty", "clean"], "36 keystrokes, two status changes");
+});
+
+test("a text over 2 Mi characters is staged after a 5 s pause, not every 1 s pause", async (t) => {
+  const { session, open, tick, calls, journal } = harness(t, { A: "alpha", B: "beta" });
+  await open("A");
+  calls.length = 0;
+  const big = 3 * 1024 * 1024;
+  // Bursts of typing with 1.5 s pauses: a small text would be staged four times.
+  for (let burst = 0; burst < 4; burst++) {
+    for (let i = 0; i < 5; i++) {
+      session.edited(`big ${burst}.${i}`, big);
+      await tick(80);
+    }
+    await tick(1_500);
+  }
+  assert.deepEqual(calls, [], "no stage of the large text in 1.5 s pauses");
+  await tick(3_500);
+  assert.deepEqual(calls, ["stage A"], "one stage after a 5 s pause");
+  assert.equal(journal.get("A"), "big 3.4");
+  // Shrunk below the limit: back to the 1 s pause.
+  session.edited("small again", 100);
+  await tick(1_000);
+  assert.deepEqual(calls, ["stage A", "stage A"]);
+});
+
+test("typing that never pauses long enough is still staged every 10 s", async (t) => {
+  const { session, open, tick, calls, journal } = harness(t, { A: "alpha", B: "beta" });
+  await open("A");
+  calls.length = 0;
+  // A large text typed with 2 s pauses (under its 5 s pause) for 30 s.
+  for (let i = 0; i < 15; i++) {
+    session.edited(`big ${i}`, 3 * 1024 * 1024);
+    await tick(2_000);
+  }
+  const stages = calls.filter((call) => call === "stage A").length;
+  assert.ok(stages >= 2 && stages <= 3, `${stages} stages in 30 s`);
+  await open("B");
+  calls.length = 0;
+  // A small text typed without a 1 s pause for 25 s.
+  for (let i = 0; i < 166; i++) {
+    session.edited(`beta ${i}`);
+    await tick(150);
+  }
+  assert.deepEqual(calls.filter((call) => call.startsWith("stage")), ["stage B", "stage B"]);
+  assert.ok(Number(journal.get("B").split(" ")[1]) >= 130, "with the text typed up to then");
+});
+
+test("a large text is staged at once on switch, Cmd+S, blur and close", async (t) => {
+  const { session, open, tick, calls, journal, uploads } = harness(t, { A: "alpha", B: "beta" });
+  const big = 3 * 1024 * 1024;
+  await open("A");
+  session.edited("big switch", big);
+  await tick(100);
+  calls.length = 0;
+  await open("B");
+  assert.deepEqual(calls.slice(0, 2), ["stage A", "open B"], "switching stages the previous document first");
+  await tick(0);
+  assert.equal(journal.get("A") ?? uploads.at(-1)?.[1], "big switch");
+  session.edited("big save", big);
+  assert.equal(await session.save(), true);
+  assert.deepEqual(uploads.at(-1), ["B", "big save"]);
+  session.edited("big blur", big);
+  calls.length = 0;
+  session.background();
+  await tick(0);
+  assert.deepEqual(calls, ["stage B", "commit B"], "blur stages and uploads without the 5 s pause");
+  session.edited("big close", big);
+  assert.equal(await session.flushForExit(), true);
+  assert.deepEqual(uploads.at(-1), ["B", "big close"]);
 });
 
 test("120 s of continuous typing uploads without waiting for a pause", async (t) => {
@@ -388,4 +497,25 @@ test("a document reopened with an edit in the outbox is unsynced", async (t) => 
   assert.equal(await session.save(), true);
   assert.deepEqual(uploads, [["B", "beta from the outbox"]]);
   assert.equal(states.at(-1), "clean");
+});
+
+test("an edit refused while its document moves is saved under the new id", async (t) => {
+  const { session, open, journal, uploads, network, saved } = harness(t, { A: "alpha" });
+  await open("A");
+  // A document window: Rust renames its document; timed writes wait.
+  session.hold();
+  session.edited("typed as the move started");
+  network.diskFull = true; // Rust refuses the stage (BUSY) while the objects move
+  assert.equal(await session.persist(), false);
+  // The move is over: the document is A2, and the window writes again (resumeAfterMove).
+  saved.set("A2", saved.get("A"));
+  saved.delete("A");
+  network.diskFull = false;
+  session.retarget("A", "A2");
+  session.release();
+  assert.equal(await session.persist(), true);
+  await session.retryNow();
+  assert.equal(await session.save(), true);
+  assert.deepEqual(uploads, [["A2", "typed as the move started"]]);
+  assert.equal(journal.size, 0);
 });

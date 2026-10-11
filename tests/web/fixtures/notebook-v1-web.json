@@ -1,0 +1,277 @@
+{
+  "about": "Written by tests/web/write-vectors.mjs with the web codec (web/src/codec.ts). Test data only; the phrases are not secrets.",
+  "cases": [
+    {
+      "phrase": "correct horse battery staple",
+      "key_reference": "92e83165c38c5686",
+      "paths": [
+        {
+          "logical": "note.md",
+          "stored": "r1YWNG42A7dTmy_Et1qOMIuEifN_L0E"
+        },
+        {
+          "logical": "projects/roadmap/todo.md",
+          "stored": "iolXZtY2B7b8icLkQC7LAQyGE6uLrppg/4K3xphD27c8V6E-K-UYnW9UwHyKBd4U/tsM9YjY1BuyzUmIQIKgiO0xFFRD0yjg"
+        },
+        {
+          "logical": "Ünïcode/名前/ファイル.md",
+          "stored": "gOiveZ1G8grcw-gXwLM9wB9RHY28BJOCEw/1jDy3wRYH0Ee1h0Rqeoy8eB6jNMqkQ/t9mry7IjtXqkAF1yhohUIgB68dvuEFOdmCiFWxH6Zg"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "9ZKShwoIxW00zb9GON-oy2LTFwR05XEF7w"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "x2783BuTbM274RHeHx98kNArsYVyCVXV"
+        },
+        {
+          "logical": "a/b/c/d/e/f/g.md",
+          "stored": "KglIKxAGe1HiGo-ZCrWRRQ0/sTDuumknRrMsuEq8jpmgnUs/xR5XCf9qS4d9Hh5pBN3pe2Q/cIHVW5VoY043SFDJzJWWtP8/0SJ4edhNmSElb4IqGIsrdf4/7eCBM5S7l32UOhIVxpzcwFM/Nnsoy17UvOsaMoz9SXbd60_uWns"
+        },
+        {
+          "logical": "folder/.notebook_dir",
+          "stored": "wYvLLk10LDeNYHBeXsFJBFoSGxPm2w/x-6R-e8bXfh_7YeaaYhmy76hgjtAVYP6ZNs_erw"
+        },
+        {
+          "logical": "_deleted/items/1712000000123-note.md/item/note.md",
+          "stored": "cAJrVTnh9X-s_LSD23Z96LIDWtRyKOv2/mr2_L2mx5clV0L0Plh9-wyBfgEQ3/xCqK4a_hiMGJUYE5app3lm33kVA_r6llY-obEqaMp4woouqX9A/y2XCsxMtAwhfAkqP5EOJNZ4JXfs/AE52fvtsMeo1fM2dMA3s9E9um9b6-Sk"
+        },
+        {
+          "logical": "/lead//double/trail/",
+          "stored": "wbtgy0KqVRslyMHC93HDwOiyoR8/K5ShJ9uOL9YfCGnOf68MaSbgESqc3g/5LDyYGt6rTdTKz3VwBmxZXQJpuRo"
+        }
+      ],
+      "bodies": [
+        {
+          "text": "",
+          "payload": "C5oBe5BB/beRrv8yOI3ul5odlp7Mx1nWiUzxyQ=="
+        },
+        {
+          "text": "# Title\n\nhello",
+          "payload": "WCp6bQnVdUomZ8Uf5rEllGTSecWlpIStjK+Arjxndb5a2V7Beldgb3Pu"
+        },
+        {
+          "text": "﻿BOM first, then text",
+          "payload": "0E4sqiFTHB7TgnPBt84EWyG8/Yxhx5/u1M5W5OP0SSzlmo+1J65ehPbNvvYvnuofofDT"
+        },
+        {
+          "text": "line one\r\nline two\r\n",
+          "payload": "Dm7LeteQWuEcfv2J+ZN7cpBZzSOGnAjD01fC3qljB7opDnxgcVbtbQA/wrmJTjBa"
+        },
+        {
+          "text": "emoji 🔐 and Café",
+          "payload": "jzKyRg5xeOVVVA54ORHTnvYPPQ1dVcDqLIEnTdxJGCDmWOcmBeZ+zXHRA941o8cGeg=="
+        },
+        {
+          "text": "0123456789abcdef",
+          "payload": "drPtR987RVB4N+vjVNfBpppQtNnQ2uzKbcNOJjza4vSWgz2lp+wUOh2YnUs="
+        }
+      ]
+    },
+    {
+      "phrase": " \tpadded phrase　\n",
+      "key_reference": "1f36257e0cee4353",
+      "paths": [
+        {
+          "logical": "note.md",
+          "stored": "YwPsgb0wQyWK4NhlnH3dNaypJQqA-Tg"
+        },
+        {
+          "logical": "projects/roadmap/todo.md",
+          "stored": "YZkOvY0GM3amfJc45MC3ZHmUTr0_HdpM/wkLyqBBrFel6Setg5bLpP2yb3IecruY/_-AuqERBR0IXtE_Yy6FneUGP5IMqyZc"
+        },
+        {
+          "logical": "Ünïcode/名前/ファイル.md",
+          "stored": "0aNclHvmOifKl2hnUwg04Nw2H7jPAplj7g/m0xn0H2jAfY1Nh0aMYjhHRgf28irig/WzQrJ_Yo55WeHY6CgJlnGU55TQ6oYqHcl19PPlDX2Q"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "Bi8f2EYUOBCrgWN3bV9Hwufj9RMTkyNYwA"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "jlxIi4fpadn9FnfuvO7km4z57l0n4DsK"
+        },
+        {
+          "logical": "a/b/c/d/e/f/g.md",
+          "stored": "Ax90IzrnCgZenwdN2kfzkw8/GOFKjtINcXL8zZInymaIhQI/RErBLXLgO_DWpXUjZyK9184/c48Ac5QPiF-xdyZDGitATkg/hM7EcNB5_RP6HkTbkKqyiO0/cxU-YueVdbfsYNhWkbytbFE/3ybv4LBX15K8xSeEbpgggYvH5xw"
+        },
+        {
+          "logical": "folder/.notebook_dir",
+          "stored": "8zs9AkE2yJrbBFDlRUKDMqvTApFRYQ/RBAI_7gtPhhnqsB25Bq0bQSkpd1PzZdo3sFdjXQ"
+        },
+        {
+          "logical": "_deleted/items/1712000000123-note.md/item/note.md",
+          "stored": "Ft3ZdDhwnaGPRUyCZBD4f67r-ijN-BZk/AcR-iJeHywl2ELbXwwKVaWnb9dsZ/YFW4Xp0rwktMTc95Bz7pQ2VmFUHGt8m1-tMVSW7HkLEHAP_0ZQ/L1tJ6oyPYyRV4BNdktlEyztsNpg/60FrjdgWyS6BULD-1E3uZwTmaMawqs4"
+        },
+        {
+          "logical": "/lead//double/trail/",
+          "stored": "JWhwIOY0AGo2k-QLkx4JYomRcLs/88NBwaF9FYLpjVINfR4n6dOK7mthGw/NYib3Z7IumuayM3GBDMe3G-Iw5us"
+        }
+      ],
+      "bodies": [
+        {
+          "text": "",
+          "payload": "BFUWuAOUUA1JvUeX59UL0PtK0i+BOhK/605HKA=="
+        },
+        {
+          "text": "# Title\n\nhello",
+          "payload": "B1O0dLdt8aAhhoIpDPf3QhTuCR9MGeatdUIn5nLXEE0OBJBwsBJq3vXp"
+        },
+        {
+          "text": "﻿BOM first, then text",
+          "payload": "YHOCLUGtqBpf/1JSosqeQU3vZzSl2T+yvqu5QH+otOomYXEq5/IlTI8SrJVGBAdUUWFn"
+        },
+        {
+          "text": "line one\r\nline two\r\n",
+          "payload": "KiIYW3hyNN5sMiyIo0ueJvdXX2Oa+SpmtcYKM4al4toqgWuXHgsjYJqrU7yXQMDl"
+        },
+        {
+          "text": "emoji 🔐 and Café",
+          "payload": "l1X344llbRhiYeA3yPQv8GteCenh6GNoLxkQJJ6mppTsW44TPyp2Z0kFjW8y5I5q2A=="
+        },
+        {
+          "text": "0123456789abcdef",
+          "payload": "u6jBkpY0WrhX+ovpGaWbYNduEPIDi/5Nr8Tqpji1SGQnFrKV9x9a1pqR52s="
+        }
+      ]
+    },
+    {
+      "phrase": "﻿bom stays",
+      "key_reference": "290e5b4bd3869c61",
+      "paths": [
+        {
+          "logical": "note.md",
+          "stored": "HH0sGQKDrbxiiNpuhs7RVps36AEq5L8"
+        },
+        {
+          "logical": "projects/roadmap/todo.md",
+          "stored": "7y6Pf22F_DZwiPwcPVqDjaDWmTYjxC3Y/zPHEDdriqAT79TlPmG1KEh5VTUNfX6Q/IM9pl_RVR32fx-QjFK5IQrBPVrsVsf4"
+        },
+        {
+          "logical": "Ünïcode/名前/ファイル.md",
+          "stored": "oxaN2k1CXSNXh1Y9BBZ6OpXVjGfj6cfseg/UWcRj1AIjpBgSe1B4Lt_jmSi93F-9A/uBvNDUuYIgnskWVfqHabzYf_I-3LYlE5Luup2Vx8EQ"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "KZIXegTq_-jc9fzwz7CkeDwoSb1Mmj80cg"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "mwQd8wsoxGAG58236nfTulUSu8Hl47E5"
+        },
+        {
+          "logical": "a/b/c/d/e/f/g.md",
+          "stored": "II-57AD2hYq3jM4xMRz03X8/dm88gYnNZ975nc1JcLIiTLg/tq1RxYreQnUmYzb-EFAUSwo/GhfLdWyVykwNl6rjVPArXpg/5h2anl3R4gkrhv0w2odnnFk/HXrRxrlCsawOb9in1faCYUI/bRQUALjlCvh_QYgXyPlXumexP08"
+        },
+        {
+          "logical": "folder/.notebook_dir",
+          "stored": "PMnMjbqwNK4rq5b0uN4VJvBmLGRgmg/618cfLv5WtcAxTw75xHA2weBxTLN5bQx_VGcq-M"
+        },
+        {
+          "logical": "_deleted/items/1712000000123-note.md/item/note.md",
+          "stored": "mC6hxs5QzZbVnF34MNiP-vHM0FPqd2x5/7QXRANvDgunb0ZGZ6UsM-yk_hnFX/IV5PPdwlaOZcJqpC7-xna2kt4hMe6VP8_MH4OId7jDvIKPln2w/0-rmsa4roXlkZhuxQIiX16Eq5fE/Zatb0Szx-cp2J5YW6rnE06FknaOhOCA"
+        },
+        {
+          "logical": "/lead//double/trail/",
+          "stored": "srifjVD-0XIZbdfxBa5WZ4zJ2Wk/tmUt9cUhYa3pDDG30loy8cwfiHoYMA/wSpnnCvweoz0lRL28GAP0IkbxIfD"
+        }
+      ],
+      "bodies": [
+        {
+          "text": "",
+          "payload": "yU12r9/36liad1+CB0lxxQjNSg7ir9nQCoAjtw=="
+        },
+        {
+          "text": "# Title\n\nhello",
+          "payload": "xowlC1jdEd0LskbdXV66D9Icqf35EJOoQdmaqV8o2Kb0jwuwwNE5vx3/"
+        },
+        {
+          "text": "﻿BOM first, then text",
+          "payload": "ww0nCIXMYB2WPTBZ85ferByZ9JxnatRCdfoXTt9JR8zJ4dEtJfikd4dE3LcBe+ywOkqr"
+        },
+        {
+          "text": "line one\r\nline two\r\n",
+          "payload": "fN4+nZ/BML8nkxswZoVBblrvKd+VPEyXfOhBNFEk+iqxS+h5czZC9mpM+KTALBmP"
+        },
+        {
+          "text": "emoji 🔐 and Café",
+          "payload": "NMWN0jD3GXW2IiOz+jNp+dLyhECE5uAsRAo+QLZgWqvchC10bQnj2Hlf1fYbfCK26g=="
+        },
+        {
+          "text": "0123456789abcdef",
+          "payload": "0MNNJHSgVpUsoC00X4GHqe9JYbPQ2VGmoDE8eomogC6xZ1fVJVWGm6T4uqs="
+        }
+      ]
+    },
+    {
+      "phrase": "Café 🔐 фраза",
+      "key_reference": "c166ff39732648cc",
+      "paths": [
+        {
+          "logical": "note.md",
+          "stored": "2Kq_HiTuUSJDIo5Wfeke4qJ4Nb5guQw"
+        },
+        {
+          "logical": "projects/roadmap/todo.md",
+          "stored": "24fXenBjeZBgK0eTingXx443Tgmx3XW-/KdaQleH5QIktXdZkaf0xLO6mzJqP9uw/t47NyBMo6jnweVZ_dGkpBPt8QzXWscQ"
+        },
+        {
+          "logical": "Ünïcode/名前/ファイル.md",
+          "stored": "2KAGwx0KwfHLhCaIpjFpV_Lcs1jr2qmYEg/VMFUgUJMo5D3d9V_b4KrYFtKoIF-Kg/p7ljpfZKmfPkTGw50R7nbSZZdLhF04_AnnuKHPQYJQ"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "57CeZ4lNYhzfeJIkHVhmNRi1nJ65EZ2J3A"
+        },
+        {
+          "logical": "Café.md",
+          "stored": "DQlwZWFXcKb4B0vLCaL11ubqLyGow9-w"
+        },
+        {
+          "logical": "a/b/c/d/e/f/g.md",
+          "stored": "m8KrTv2TIT1qQFB3zZ1JrGw/E-8useXd1_oolKgNqkWjUHI/wes6KH6NvLittECvMkaPz2U/TOzI3OF3xCm1gU1_gKWfxNY/Rn34XsZdyhC3h-0Mkx-ogb4/oAQOMT-kyoBVuXM_7I8Xbws/uXX4iJ_7cDbNzEnHbhUG5DPTOgo"
+        },
+        {
+          "logical": "folder/.notebook_dir",
+          "stored": "lRsVguyo3Phbfc3jiAmkYFA3eJdnNA/OWzSaK287Dz73LLBwmTn9kRnEX_f5tRP1MIaixo"
+        },
+        {
+          "logical": "_deleted/items/1712000000123-note.md/item/note.md",
+          "stored": "ylpnoO5-fhhyrwjjx5v1PumVz04JLOMu/HCmClw9yc58CZItdDtzhRgAvJ-6k/eIvM9uRH0gOzUc8od0SWV9R4OaYS1OsEzMjPLyV5cVIEMhWfFg/RGbiB0ZuKRJyU0WVlM2yxhGDS0Y/ZhVNHuXK6P4M5I2bGTcLcKi0oLF8h-o"
+        },
+        {
+          "logical": "/lead//double/trail/",
+          "stored": "wSdLiO9pVC9_12a2cshsEhODo4Q/EUGxTrcURqWjL__GWjJ2Z9ygHHD9gQ/AHq69TbChDbi3bESznIPxOF1UXWu"
+        }
+      ],
+      "bodies": [
+        {
+          "text": "",
+          "payload": "aUnKdeUH9QXTtncM6aqPKfoUG1nb4pP5BI2x6g=="
+        },
+        {
+          "text": "# Title\n\nhello",
+          "payload": "MrGpkep+Nzzc6OHAyYLZHX3jS6zY/Ua916Pir2ouOO4bAVmqlRjQ34wH"
+        },
+        {
+          "text": "﻿BOM first, then text",
+          "payload": "3lQnSHSvAZw7r84ZjCuolfQWcnhVeEjYwdXjpC7XaoX/b4CQ6epfw7AVNCKYO7XMkhly"
+        },
+        {
+          "text": "line one\r\nline two\r\n",
+          "payload": "+C3kwjDbkzN8Rujc0aYa/LeFSDa0RAs/WRvsV4pEkAJrjWrerWhOSPtOscYuNVRV"
+        },
+        {
+          "text": "emoji 🔐 and Café",
+          "payload": "kO//5deqDs1/uxnq+RlrVuQGcDTFp4yAYBzuG3ALlIfhiHwcE0kLkwaIuqcETovdxA=="
+        },
+        {
+          "text": "0123456789abcdef",
+          "payload": "Ab0o6//Og32ZBtbIKw646X1rSMeWahZ+ujfBqQV+VqD1+yWESPw2FqhcWYA="
+        }
+      ]
+    }
+  ]
+}

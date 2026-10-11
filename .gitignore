@@ -1,10 +1,20 @@
+# Dependencies and build outputs
 /node_modules/
 /dist/
+/dist-web/
+/test-results/
 /src-tauri/target/
-.DS_Store
+/target/
+/coverage/
+*.tsbuildinfo
 *.log
+
+# OS files
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
+# Local environment files (never commit credentials)
 /.env
 /.env.*
-!/\.env.example
-/coverage/
-/target/

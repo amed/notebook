@@ -22,6 +22,11 @@
 //   frame's <html>, <head> and <body> elements: WebKit ties a frame's styled
 //   scrollbar to the element that styled it, and once that element was
 //   replaced it drew no scrollbar at all.
+// - Zoom (preview-zoom.ts) is CSS `zoom` on the page's root, in the same
+//   style element: the text stays crisp and re-flows, and changing it rewrites
+//   one rule, never the page.
+// - Removed scripts are counted for the status bar (`onScripts`), not shown
+//   in the pane.
 
 import { externalUrl, MAX_LINK_LENGTH } from "./navigation";
 import { parseCssColor } from "./theme";
@@ -48,7 +53,7 @@ const linkHref = (url: string): string => `${FRAME_URL}?${OPEN}=${encodeURICompo
  * `#id` links, and web or mail links (rewritten, see the header comment).
  * `scripts` counts the executable scripts that were removed.
  */
-export function sanitizeHtmlPage(source: string): { page: Document; scripts: number } {
+function sanitizeHtmlPage(source: string): { page: Document; scripts: number } {
   const page = new DOMParser().parseFromString(source, "text/html");
   let scripts = 0;
   for (const script of page.getElementsByTagName("script")) {
@@ -157,25 +162,30 @@ function pageBackground(doc: Document): { css: string; dark: boolean } | null {
  * The app's scrollbar (section 10 of theme.css) for the page in the frame.
  * WebKit leaves the page background out from under a frame's scrollbar, so
  * the track takes the page's background, and the thumb's ink contrasts with it.
+ * WebKit and Chromium scale the page's scrollbar with the root's zoom: the
+ * sizes are divided by `zoom`, so the bar keeps the app's size.
  */
-function scrollbarCss(background: { css: string; dark: boolean } | null): string {
+function scrollbarCss(background: { css: string; dark: boolean } | null, zoom: number): string {
   const root = getComputedStyle(document.documentElement);
   const token = (name: string, fallback: string): string => root.getPropertyValue(name).trim() || fallback;
+  const length = (name: string, fallback: string): string => {
+    const value = token(name, fallback);
+    return zoom === 1 || !/^[\d.]+px$/.test(value) ? value : `${+(parseFloat(value) / zoom).toFixed(2)}px`;
+  };
   const ink = background?.dark ? token("--html-preview-scrollbar-ink-dark-page", "255, 255, 255") : token("--html-preview-scrollbar-ink", "0, 0, 0");
-  const size = token("--scrollbar-size", "12px");
+  const size = length("--scrollbar-size", "12px");
   const thumb = `rgba(${ink}, ${token("--scrollbar-thumb-alpha", "0.1")})`;
   const active = `rgba(${ink}, ${token("--scrollbar-active-thumb-alpha", "0.2")})`;
   return `::-webkit-scrollbar{width:${size};height:${size};background:${background?.css ?? "transparent"}}`
     + "::-webkit-scrollbar-corner,::-webkit-scrollbar-track{background:transparent}"
-    + `::-webkit-scrollbar-thumb{min-height:${token("--scrollbar-thumb-min-length", "40px")};border:${token("--scrollbar-thumb-inset", "3px")} solid transparent;`
-    + `border-radius:${token("--scrollbar-thumb-radius", "12px")};background-color:${thumb};background-clip:padding-box}`
+    + `::-webkit-scrollbar-thumb{min-height:${length("--scrollbar-thumb-min-length", "40px")};border:${length("--scrollbar-thumb-inset", "3px")} solid transparent;`
+    + `border-radius:${length("--scrollbar-thumb-radius", "12px")};background-color:${thumb};background-clip:padding-box}`
     + `::-webkit-scrollbar-thumb:hover,::-webkit-scrollbar-thumb:active{background-color:${active}}`
     + `@supports not selector(::-webkit-scrollbar){:root{scrollbar-color:${thumb} transparent;scrollbar-width:thin}}`;
 }
 
 export class HtmlPreview {
   private frame: HTMLIFrameElement | null = null;
-  private note: HTMLElement | null = null;
   private loaded = false;
   private key: string | null = null;
   private source: string | null = null;
@@ -190,10 +200,31 @@ export class HtmlPreview {
   private scripts = 0;
   /** Set while reloading our page after a foreign document, to try only once. */
   private healing = false;
-  /** The scrollbar style this preview put in the painted page (not part of the page text). */
+  /** The scrollbar and zoom style this preview put in the painted page (not part of the page text). */
   private scrollbars: HTMLStyleElement | null = null;
+  /** The page background found by the last paint (the scrollbar track's colour). */
+  private background: { css: string; dark: boolean } | null = null;
+  /** Percent; 100 adds no rule. */
+  private zoom = 100;
 
-  constructor(private readonly openLink: (url: string) => void) {}
+  /** `onScripts` hears the count of scripts not run whenever it changes (0 after a reset). */
+  constructor(
+    private readonly openLink: (url: string) => void,
+    private readonly onScripts: (count: number) => void = () => {},
+  ) {}
+
+  /** Scripts removed from the shown page (0 while no page is shown). */
+  get scriptsOff(): number {
+    return this.frame?.isConnected ? this.scripts : 0;
+  }
+
+  /** Zooms the page to `percent`: one rule in the frame, no repaint of the page. */
+  setZoom(percent: number): void {
+    if (percent === this.zoom) return;
+    this.zoom = percent;
+    const doc = this.loaded ? this.frame?.contentDocument : null;
+    if (doc && doc === this.doc) this.writeStyle();
+  }
 
   /** Shows `source` in `host`. `key` names the document; a new key starts at the top. */
   render(host: HTMLElement, key: string, source: string): void {
@@ -208,6 +239,11 @@ export class HtmlPreview {
     this.paint();
   }
 
+  /** The painted page's scrolling element (reading position), or null before it has loaded. */
+  scroller(): Element | null {
+    return this.loaded && this.doc ? this.frame?.contentDocument?.scrollingElement ?? null : null;
+  }
+
   /** The shown document now has another id (renamed, moved or copied): keep the page and its scroll. */
   retarget(from: string, to: string): void {
     if (this.key === from) this.key = to;
@@ -216,12 +252,11 @@ export class HtmlPreview {
   /** Forgets the page text and drops the frame, for example on lock. */
   reset(): void {
     this.frame?.remove();
-    this.note?.remove();
-    this.frame = this.note = this.doc = this.scrollbars = null;
+    this.frame = this.doc = this.scrollbars = this.background = null;
     this.key = this.source = this.head = null;
     this.loaded = this.switched = this.healing = false;
     this.scroll = [0, 0];
-    this.scripts = 0;
+    this.setScripts(0);
   }
 
   private mount(host: HTMLElement): void {
@@ -232,16 +267,11 @@ export class HtmlPreview {
     frame.setAttribute("referrerpolicy", "no-referrer");
     frame.addEventListener("load", () => this.onLoad(frame));
     frame.src = FRAME_URL;
-    const note = document.createElement("p");
-    note.className = "html-preview-note";
-    note.setAttribute("role", "status");
-    note.hidden = true;
     this.frame = frame;
-    this.note = note;
     this.doc = null;
     this.loaded = this.healing = false;
-    this.scripts = 0;
-    host.replaceChildren(note, frame);
+    host.replaceChildren(frame);
+    this.setScripts(0);
   }
 
   private onLoad(frame: HTMLIFrameElement): void {
@@ -287,11 +317,13 @@ export class HtmlPreview {
     this.head = head;
     this.styleScrollbars(doc);
     doc.scrollingElement?.scrollTo(...this.scroll);
-    if (scripts !== this.scripts && this.note) {
-      this.scripts = scripts;
-      this.note.hidden = scripts === 0;
-      this.note.textContent = scripts ? `Scripts are off in the preview (${scripts} not run).` : "";
-    }
+    this.setScripts(scripts);
+  }
+
+  private setScripts(count: number): void {
+    if (count === this.scripts) return;
+    this.scripts = count;
+    this.onScripts(count);
   }
 
   /** Puts the app's scrollbar style first in the page's head; rewritten only when it changes. */
@@ -304,7 +336,15 @@ export class HtmlPreview {
       this.scrollbars = style;
     }
     if (doc.head.firstChild !== style) doc.head.prepend(style);
-    const css = scrollbarCss(pageBackground(doc));
+    this.background = pageBackground(doc);
+    this.writeStyle();
+  }
+
+  private writeStyle(): void {
+    const style = this.scrollbars;
+    if (!style) return;
+    const zoom = this.zoom / 100;
+    const css = scrollbarCss(this.background, zoom) + (zoom === 1 ? "" : `:root{zoom:${zoom}}`);
     if (style.textContent !== css) style.textContent = css;
   }
 }

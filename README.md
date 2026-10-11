@@ -1,11 +1,10 @@
 # Notebook
 
-A native Tauri Markdown and HTML workspace for an S3 bucket encrypted.
-Point both apps at the same
-bucket and prefix, then enter the same encryption phrase. The folder names, file
-names and document bodies created by either app are readable by the other.
-Both apps are called Notebook; below, "the original Notebook app" means
-`amed/notebook`.
+A native Tauri desktop app for Markdown documents and HTML pages, encrypted in
+your own S3 bucket in the format of the original Notebook app (`amed/notebook`;
+both apps are called Notebook). Point both apps at the same bucket and prefix
+and enter the same encryption phrase: the folder names, file names and
+document bodies created by either app are readable by the other.
 
 ## Install
 
@@ -140,7 +139,9 @@ never logged.
    keychain is available, the app shows the workspace's connect screen and
    says so; nothing stored is removed.
 3. Edit normally. Each edit is encrypted into a local outbox on this device
-   a second after you pause, and uploaded to S3 when you press Cmd/Ctrl+S,
+   a second after you pause (five seconds for a document over 2 MB, and at
+   least every 10 s while you keep typing), and
+   uploaded to S3 when you press Cmd/Ctrl+S,
    switch documents, leave the window, close, lock, stop typing for 30 s or
    keep typing for 2 minutes. The dot in the status bar shows unsynced
    changes (accent), offline (amber) or a failed upload (red); click it to
@@ -151,7 +152,9 @@ rename, drag-to-move, encrypted document saving, preview, title filtering,
 pasted or dropped inline images, document-file import, auto-lock, and
 recoverable Trash. The Markdown outline
 opens from the document header; its nested heading levels can be folded one at
-a time or all together, and selecting a heading jumps to its source line.
+a time or all together, and selecting a heading (click, or Enter / Space)
+shows it in the panes shown: the editor goes to its line in Edit, the
+preview scrolls to it in Preview, and Split does both.
 **Word count** in the status bar shows words, characters, lines and the
 selected words, counted once when you click it (HTML pages: the page text,
 without tags). It does not update while you type; typing, Esc or a click
@@ -164,6 +167,44 @@ vault as a breadcrumb (`Folder / Sub / name`; the full path is the tooltip),
 then icon buttons for the outline, Edit / Split / Preview, Refresh, Settings
 and Lock. The workspace picker and New file / New folder sit beside it at the
 top of the sidebar.
+
+**Focus mode** (F9) shows the document alone: no sidebar, header, status bar
+or outline, and the window title is the file name (it is "Notebook" again
+when you leave focus mode, lock or switch workspaces). It opens in Preview;
+Cmd/Ctrl+Shift+V switches to the editor and back, so you can also write
+there. F9, or Esc outside the editor, brings back the layout you had. Quick
+open, New file and New folder (and dropping files to import) leave focus mode
+first; F2 and Delete do nothing in it. On a Mac keyboard whose top row
+controls media, press fn+F9.
+
+After a click in an HTML page (Split, Preview, focus mode or a document
+window), the page keeps the keys until no text is selected in it (Copy works
+meanwhile), then arrow, page and space keys scroll it and the shortcuts work
+again.
+
+**Reading and writing**: Cmd/Ctrl+Shift+V switches between Preview and the
+writing mode you used last (Edit or Split), in or out of focus mode; the
+Edit / Split / Preview buttons follow. You stay where you were: the editor
+opens at the part you were reading (the caret moves there if it was out of
+view), the preview at the part you were writing, and F9 keeps your place
+too. In Quick open and in dialogs the keys keep their usual meaning.
+
+**Open in new window** (the header's window button, a document's menu in the
+sidebar, or Cmd/Ctrl+Shift+O) shows the document in a window of its own that
+you can move and resize like any window: the file name is its title, and it
+has no sidebar, header or status bar. It opens in Preview; Cmd/Ctrl+Shift+V
+switches to writing, Cmd/Ctrl+S uploads, and closing it saves first, as the
+main window does. F9 and Esc do nothing there. Only one window writes a
+document at a time: while it is open in its own window, the main window shows
+it read-only with "Editing in another window" in the header (click it to bring
+that window to the front) and shows each upload the other window makes. When
+that window closes, the main window can write the document again. Opening the
+same document again brings its window to the front. Renaming or moving the
+document retitles its window; moving it to the Trash closes the window (its
+edit is saved first) and says so. While a rename, move or Trash runs, that
+window is read-only for a moment. Lock, switching workspaces, changing the
+phrase and quitting save and close every document window first; if one cannot
+save its edit even on this device, nothing is locked or closed.
 
 Quick open has a clear button (×) while it holds text; Esc clears it too, and
 a second Esc leaves the field. The outline has a close button (×) next to
@@ -187,16 +228,27 @@ Keyboard shortcuts (Cmd on macOS, Ctrl on Windows and Linux):
 | Cmd/Ctrl+S | Upload the open document now |
 | Cmd/Ctrl+N, Cmd/Ctrl+Shift+N | New file, new folder |
 | Cmd/Ctrl+P | Quick open (title filter) |
-| Cmd/Ctrl+Shift+V | Cycle Edit, Split and Preview |
+| Cmd/Ctrl+Shift+V | Reading (Preview) and writing (Edit or Split, the last used) |
+| F9 | Focus mode: the document alone, file name in the window title |
+| Cmd/Ctrl+Shift+O | Open the document in a new window (Cmd/Ctrl+Shift+N stays New folder) |
+| Esc (focus mode, outside the editor) | Leave focus mode |
+| Cmd/Ctrl+= or +, Cmd/Ctrl+-, Cmd/Ctrl+0 | Zoom the editor and the preview in, out, back to 100% (every mode and window) |
 | Cmd/Ctrl+L | Lock the workspace |
 | Option+Z (macOS), Alt+Z | Toggle soft wrap, as in VS Code (the key printed Z, on any layout) |
+| Cmd/Ctrl+F (in the editor) | Find and replace (Enter next, Shift+Enter previous, Esc closes) |
+| Option/Alt+click, Option/Alt+Shift+drag (in the editor) | Add a caret, select a column |
 | F2 | Rename the selected item |
 | Delete / Backspace (sidebar) | Move the selected item to Trash |
 
 Soft wrap is on by default and applies to every document until you toggle it
 again (until the app quits); **Wrap** in the status bar shows the state and
-also toggles it. Cmd/Ctrl+Z stays Undo. Option+Z still types its character in
-text fields and dialogs.
+also toggles it. Tab indents the way the document already does (tabs, or two
+or four spaces). Cmd/Ctrl+Z stays Undo. Option+Z still types its character in
+text fields and dialogs. A document with a line of more than 512K characters
+(a one-line page; image data does not count) is shown unwrapped, and **Wrap**
+says so. Each open document keeps its undo history, selection and scroll
+position while you switch between documents (the last ten) and when it is
+renamed or moved.
 Closing the window or quitting saves the open document first: the outbox write
 takes milliseconds, and S3 gets at most 3 seconds, so closing never hangs on
 the network. Edits not uploaded yet wait, encrypted, in the local outbox kept
@@ -262,7 +314,12 @@ in both and can be restored or deleted permanently from either.
   overwritten or renamed: the app says so and offers **Restore to…**, where
   you pick a folder and a name.
 - **Delete permanently** and **Empty Trash** remove only the bin objects of the
-  listed items. Nothing is emptied automatically.
+  listed items. Nothing is emptied automatically. They send one DeleteObjects
+  request per 1,000 objects; where S3 refuses it (some bucket policies and
+  S3-compatible services do), the same objects are deleted one request each,
+  and the rest of the session skips DeleteObjects. `s3:DeleteObject` covers
+  both. If some deletes fail, the item stays in Trash and Delete permanently
+  can be repeated.
 - `_deleted`, `_delete` and `.secure-vault-trash` at the top of the workspace
   never show in the tree, quick open, search or counts. None of the three can
   be used as a name.
@@ -280,25 +337,47 @@ in both and can be restored or deleted permanently from either.
   deny-by-default content policy block scripts, forms, popups, downloads and
   all network requests. Inline CSS, inline SVG and inline raster data images
   render, `#section` links scroll inside the page, and web or mail links open
-  only after you confirm them. A page that needs JavaScript shows "Scripts are
-  off in the preview (N not run)." The preview keeps its scroll position while
+  only after you confirm them. The preview keeps its scroll position while
   you edit, and long pages scroll with the wheel, trackpad or keyboard and
   show the app's scrollbar (dark on light pages, light on dark ones). The full
   HTML source is encrypted and stored in S3 exactly like a Markdown document.
 - The preview and the outline update a moment after you stop typing, and only
-  while they are shown; switching between Edit, Split and Preview, or opening
-  and closing the outline, re-renders nothing that has not changed. For
-  documents over 512 KB the preview pauses: it shows "Preview paused for large
-  documents." and renders the current text when you click **Render**.
+  while they are shown; the outline only when its headings changed. Switching
+  between Edit, Split and Preview re-renders nothing that has not changed. The
+  outline shows a few hundred headings at a time and adds more as you scroll
+  it. For documents over 512 KB, Split pauses its preview: it shows "Preview
+  paused for large documents." and renders the current text when you click
+  **Render**. Preview, focus mode and document windows render large documents
+  by themselves. Scripts in an HTML page never run; the status bar says how
+  many were left out ("Scripts off").
+- Zoom what you see with Cmd/Ctrl+= or +, Cmd/Ctrl+- and Cmd/Ctrl+0 (actual
+  size), from 50% to 200%: one level for the editor's text and the preview
+  (Markdown, plain text and HTML pages) together, with the readable width
+  scaled alike. The keys work in Edit, Split, Preview, focus mode and
+  document windows, wherever the focus is (in the editor they never type);
+  not while a dialog is open. The new level shows for a second near the top
+  ("110%") and is remembered. A very large HTML page follows a moment later
+  (about half a second at 12 MB).
 - **New file** starts with the current folder's root-relative path and selects
   only the extensionless filename. A name without an extension becomes `.md`;
   an explicit extension such as `.html` is preserved. You can edit the full
   path, and missing folders are created before the encrypted document.
-- Drop UTF-8 Markdown, text, or HTML files onto a folder in the sidebar to
-  import them there, or elsewhere in the workspace to use the current folder.
+- Drop UTF-8 Markdown, text, or HTML files, or whole folders, onto a folder
+  in the sidebar to import them there, or elsewhere in the workspace to use
+  the current folder. Dropped folders are recreated with everything below
+  them, empty folders included; hidden items (names starting with `.`, such
+  as `.DS_Store` or `.git`) and other file types are left out, and reserved
+  names (`_deleted`, `_delete`) are refused. A name already taken gets a
+  number, so nothing is overwritten or merged. One drop takes at most 5,000
+  files and 2,000 folders; the sidebar shows "Importing 12 of 340…", and one
+  dialog at the end lists what was skipped or failed (the first 20 names).
+  Locking or switching the workspace stops an import.
   Files are limited to 16 MiB and their initial content is encrypted in the
   same conditional S3 create—there is no temporary plaintext or empty remote
   document. Images dropped on the editor are still embedded in the open note.
+  In the editor an embedded image's base64 data shows as one mark such as
+  "⋯ 2.4 MB"; the text itself is unchanged (copy, search and the preview see
+  all of it), and Backspace removes the data as one piece (Cmd/Ctrl+Z undoes).
 - Pasted images, which are stored inside the document, are shown. Every other
   image, including remote `http(s)` images, is replaced by an "Image blocked"
   placeholder, so opening a document never contacts a third party.
@@ -306,6 +385,35 @@ in both and can be restored or deleted permanently from either.
   URL. After you confirm, it opens in your default browser or mail app. Other
   links, and links longer than 2048 characters, are not opened. The app window
   never navigates away from the app and never opens new windows.
+
+### Links
+
+- Every Markdown heading has an id: `h-` and its GitHub-style slug (lowercase,
+  punctuation other than `-` and `_` dropped, spaces as `-`, letters of every
+  script kept; a repeated heading gets `-1`, `-2`, …), so `## parse_config`
+  is `#parse_config`. `[text](#heading-text)`, `[text](#Heading%20Text)` and
+  `[text](<#Heading Text>)` scroll the preview to that heading, and the next
+  Tab goes on from there; footnote links keep working. The window's URL never
+  changes.
+- Relative links open other documents of the workspace in the app:
+  `[x](notes/other.md)`, `[x](../a/b.md#section)`, `[x](page.html)`. They
+  start in the linking document's folder (`/top.md` starts at the root),
+  names match without case as Notebook names do, `%20` and other escapes are
+  decoded, and a link without an extension also finds the `.md` document.
+  A `#heading` scrolls to that heading once the document is open. A link to a
+  folder selects it in the sidebar (leaving focus mode); a missing target
+  says so in a short message. These links never leave the app.
+- Wikilinks work too: `[[Note]]`, `[[Folder/Note]]`, `[[Note#Heading]]`,
+  `[[Note|shown text]]` and `[[#Heading]]`. A name matches documents with
+  that name, with or without its extension (Markdown first); of several, the
+  one nearest the linking document wins, and two as near say the link is
+  ambiguous, so add a folder.
+- In a document window, a heading of its own document scrolls that window;
+  every other document opens in the main window, which comes to the front.
+- Document text never chooses an id or an internal link: the preview builds
+  both (`h-…` ids, and `nb-doc:` / `nb-wiki:` links that carry only a path and
+  a heading), and the app checks every target against the workspace's folders
+  before it opens anything.
 
 ### Network
 
@@ -364,7 +472,7 @@ whose items are current objects.
 
 ## Development
 
-Requirements: Node.js 22.12+, Rust 1.90+, and the
+Requirements: Node.js 22.18+, Rust 1.90+, and the
 [platform prerequisites for Tauri 2](https://v2.tauri.app/start/prerequisites/).
 
 ```bash
@@ -389,24 +497,22 @@ the real desktop app against that dev server.
 ## Testing
 
 ```bash
-npm test
-cargo test --manifest-path src-tauri/Cargo.toml
-node --test "tests/unit/*.test.mjs"
+npm test             # type check, unit tests, Rust suite
+npm run test:unit    # tests/unit/ only
+npm run check:budgets   # bundle size budgets, after npm run build
 ```
 
-`npm test` runs the strict TypeScript check and then the Rust suite;
 `npm run build` also type-checks before bundling. `tests/unit/` checks without
 a browser that an edit is always saved into the document it was typed in, also
 when documents are switched quickly, an open fails, or an item is renamed, and
 the save model's budgets (at most 16 uploads and 60 status changes in a
 30-minute typing trace, nothing sent for Cmd/Ctrl+S without changes, close
-within 3 s while S3 hangs); Node 22.18 or newer runs the TypeScript module
-directly. `src-tauri/tests/s3_budget.rs` runs the commands against an
-in-process fake S3 that counts requests and connections and can hang. The Rust suite covers
-fixed-format compatibility, wrong-key authentication, tree reconstruction,
-reserved-name validation, signed request parsing, and a wire-boundary canary
-test proving that plaintext document names and contents do not occur in PUT
-requests.
+within 3 s while S3 hangs); Node runs the TypeScript modules directly.
+`src-tauri/tests/s3_budget.rs` runs the commands against an in-process fake
+S3 that counts requests and connections and can hang. The Rust suite also
+covers the original Notebook app's encryption format, wrong-phrase
+rejection, tree reconstruction, reserved names, the DeleteObjects request
+signature, and that `secrets.json` never holds a secret in plaintext.
 
 `scripts/notebook-compat.sh` proves that Trash works with Notebook's own code
 (Docker, `rsync`, `openssl` and curl 7.75 or newer are required):
@@ -432,8 +538,9 @@ with a `minio` binary.
 
 `npm run test:e2e` runs the `tauri-driver` WebDriver smoke test in `tests/e2e/`
 against the release binary in a throwaway profile. It checks that the setup
-screen renders from the embedded frontend, IPC works, the CSP blocks inline
-scripts but allows the editor worker, links open only through the confirmation
+screen renders from the embedded frontend, `Object.prototype` is frozen
+(`freezePrototype`), IPC works, the CSP blocks inline scripts and workers but
+lets the editor's styles apply, links open only through the confirmation
 dialog, the window never navigates away or opens another window, even when
 page script bypasses the link handler, and page script cannot close, minimize
 or maximize the window or listen to events. `tauri-driver` supports Linux and
@@ -455,6 +562,41 @@ binary (default `src-tauri/target/release/notebook-vault` on Linux and
 `notebook.exe` on Windows), and `TAURI_DRIVER` and `TAURI_NATIVE_DRIVER`
 override the `tauri-driver` and native driver paths.
 
+The **leakage scan** (spec section 16) is a scripted session on Linux
+followed by `scripts/leak-scan/`, a dependency-free Node script that searches
+files for canary strings as UTF-8, UTF-16LE, UTF-16BE, hex and base64. It
+exits 1 on any hit and 2 when a file could not be read, because that file
+was never searched (`node scripts/leak-scan/leak-scan.mjs --canary <text>
+[--allow-unreadable] <path>…`). `tests/leak/session.test.mjs` drives the debug build (only debug
+builds accept its loopback `http://` fake S3) with random canaries in a folder
+name, a document name, three edits (the last staged while S3 is unreachable,
+so the outbox holds it), the S3 secret key and the remembered phrase; it
+renders the preview, locks, unlocks with the remembered phrase, reads the text
+back, and moves the document to Trash and back. While locked it checks that
+the outbox and `secrets.json` hold only ciphertext; after shutdown it scans
+the whole throwaway profile (config, secrets, outbox, WebView data and
+caches, temp, `XDG_RUNTIME_DIR`), new files in the system temp folders and
+the caller's own `XDG_RUNTIME_DIR`, the captured driver and app output, and
+every raw object in the bucket; an
+unreadable file in the profile fails the test. The test starts its own D-Bus
+session bus and gnome-keyring in the profile, so the app never reaches the
+desktop's keychain.
+
+```bash
+sudo apt install webkit2gtk-driver xvfb dbus gnome-keyring
+npm run tauri -- build --debug --no-bundle
+xvfb-run -a npm run test:leak   # NOTEBOOK_LEAK_APP overrides the binary
+```
+
+`npm run check:budgets` (after `npm run build`) fails when the main JS chunk,
+the boot chunk, the CSS or the whole `dist/` grows past its budget in
+`scripts/check-budgets.mjs` (the overhaul's sizes plus about 10%), or when
+the build gains a worker, font, source map or extra chunk. Typing and
+scrolling latency are not measured in CI: hosted runners render WebKitGTK in
+software under Xvfb on shared CPUs, where frame times vary more than the
+regressions worth catching (typing p95 is about 20 ms on a Mac); they are
+measured with a scratch macOS build before releases.
+
 Before each release, check by hand on every OS (on macOS this replaces the
 end-to-end test): unlock, create, edit, save, close, reopen, Trash and restore;
 shortcuts; outline folding and heading jumps; Word count (opens on click,
@@ -465,17 +607,16 @@ and rendering; preview links; window behavior; high-DPI screens; dark mode;
 and Unicode in names and text (emoji, CJK, right-to-left, combining accents).
 
 The **CI** workflow runs on pushes to `main`, pull requests, and manual
-dispatch: build, format check, Clippy, and tests on Linux, macOS, and Windows;
-the end-to-end test against a release build on Linux and Windows; and
+dispatch: build, format check, Clippy, and tests on Linux, macOS, and Windows
+(with the S3 request budgets); the size budgets on Linux; the end-to-end test
+against a release build on Linux and Windows; the leakage scan on Linux; and
 supply-chain audits. The same checks locally:
 
 ```bash
 cargo install cargo-audit cargo-deny --locked   # once
 cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
-npm audit --omit=dev
-cargo audit --file src-tauri/Cargo.lock
-cargo deny --manifest-path src-tauri/Cargo.toml --locked check
+npm run audit   # npm audit --omit=dev, cargo audit, cargo deny --locked check
 ```
 
 ## Build installers locally
@@ -488,7 +629,10 @@ requirements from [Development](#development) first; outputs land under
 
 Requires Xcode or the Command Line Tools (`xcode-select --install`) and Rust
 (rustup). One command builds a universal app for Apple silicon and Intel; it
-finds Homebrew's rustup, adds both targets and installs npm packages if needed:
+finds Homebrew's rustup, adds both targets and installs npm packages if needed.
+The linker strips the binary (`src-tauri/build.rs`), so the result does not
+depend on which `cargo` is on `PATH`, and `.cargo/config.toml` turns on
+hardware AES on Apple silicon (do not set `RUSTFLAGS`, which replaces it):
 
 ```bash
 npm run build:mac

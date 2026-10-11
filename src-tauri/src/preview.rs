@@ -3,17 +3,42 @@
 //! text. Images are shown only when inline as base64 PNG, JPEG, GIF or WebP
 //! (Notebook stores images that way); anything else becomes a placeholder, so
 //! the preview never fetches a remote resource.
+//!
+//! Links (README "Links"): every heading gets a generated id ("h-" and a
+//! GitHub-style slug of its text), and `#Heading` links point at it; links to
+//! other vault documents (`notes/a.md#part`, `[[Note#Heading|alias]]`) become
+//! `nb-doc:` / `nb-wiki:` hrefs that only the app's link handler follows
+//! (main.ts resolves them against the tree). Document text never chooses an
+//! id or an internal href: both are built here and checked by the sanitizer.
 
 use crate::notebook::IpcError;
 use ammonia::{Builder, UrlRelative};
-use pulldown_cmark::{Alignment, CowStr, Event, Options, Parser, Tag, TagEnd};
-use std::collections::{HashMap, HashSet};
+use pulldown_cmark::{
+    Alignment, CowStr, Event, HeadingLevel, LinkType, Options, Parser, Tag, TagEnd,
+};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::sync::LazyLock;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 use url::Url;
 
 pub const MAX_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 const BLOCKED_IMAGE: &str = r#"<span class="blocked-image">Image blocked</span>"#;
 const FOOTNOTE_ID_PREFIX: &str = "footnote-";
+/// Heading ids: a fixed prefix, so no id can name an app element or a
+/// global (`__proto__` becomes `h-__proto__`).
+const HEADING_ID_PREFIX: &str = "h-";
+/// Hrefs of links to other vault documents: a relative path, or a wikilink
+/// target, percent-encoded, and an optional heading id. The WebView never
+/// loads them (navigation.ts hands them to main.ts; the navigation guard
+/// would refuse them anyway).
+pub const DOC_LINK_SCHEME: &str = "nb-doc:";
+pub const WIKI_LINK_SCHEME: &str = "nb-wiki:";
+/// Slugs are cut here (in chars), before a duplicate's suffix.
+const MAX_SLUG_CHARS: usize = 200;
+/// Longest path or wikilink target (in chars) that becomes an internal link.
+const MAX_LINK_TARGET_CHARS: usize = 1024;
 /// Containers nested deeper than this are flattened into their parent: the
 /// sanitizer's HTML parser takes time quadratic in the nesting depth.
 const MAX_NESTING: usize = 32;
@@ -37,7 +62,8 @@ pub fn render(markdown: &str) -> String {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES;
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_WIKILINKS;
     let events = Rewriter::new(Parser::new_ext(markdown, options));
     let mut html = String::with_capacity(markdown.len() + markdown.len() / 2);
     pulldown_cmark::html::push_html(&mut html, events);
@@ -66,8 +92,209 @@ fn is_footnote_id(value: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// GitHub's heading slug (github-slugger): the whole text lowercased (so a
+/// final `Σ` becomes `ς`; `str::to_lowercase` applies that rule, per-char
+/// lowercasing does not), letters, numbers, marks, `-` and `_` kept, each
+/// whitespace character a `-`, everything else dropped. src/vault-links.ts
+/// `slugify` is the same function.
+pub fn slug(text: &str) -> String {
+    text.nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .filter_map(|c| {
+            if c.is_whitespace() {
+                Some('-')
+            } else {
+                is_slug_char(c).then_some(c)
+            }
+        })
+        .take(MAX_SLUG_CHARS)
+        .collect()
+}
+
+fn is_slug_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_' || is_combining_mark(c)
+}
+
+/// A generated heading id: the prefix and slug characters only.
+fn is_heading_id(value: &str) -> bool {
+    value
+        .strip_prefix(HEADING_ID_PREFIX)
+        .is_some_and(|slug| slug.chars().all(is_slug_char))
+}
+
+fn is_heading_tag(tag: &str) -> bool {
+    matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
+/// The ids of a document's headings, in order; a repeated slug gets `-1`,
+/// `-2`, … as on GitHub, so every id is unique.
+#[derive(Default)]
+struct HeadingIds {
+    seen: HashMap<String, usize>,
+}
+
+impl HeadingIds {
+    fn next(&mut self, text: &str) -> String {
+        let base = slug(text);
+        let mut id = base.clone();
+        while self.seen.contains_key(&id) {
+            let count = self.seen.entry(base.clone()).or_insert(0);
+            *count += 1;
+            id = format!("{base}-{count}");
+        }
+        self.seen.insert(id.clone(), 0);
+        format!("{HEADING_ID_PREFIX}{id}")
+    }
+}
+
+/// Percent-encodes every byte but ASCII letters, digits, `-._~` (and `/`
+/// with `keep_slash`), so an internal href is plain ASCII.
+fn percent_encode(value: &str, keep_slash: bool) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~')
+            || (keep_slash && byte == b'/')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+/// Decodes `%XX` escapes (a `%` without two hex digits stays as it is);
+/// None when the bytes are not UTF-8.
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        if let Some(byte) = escape {
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// A link's `#fragment` as the id it targets: a footnote id as it is, else
+/// the heading id of its (decoded) text. None when nothing is left of it.
+fn fragment_id(fragment: &str) -> Option<String> {
+    if is_footnote_id(fragment) {
+        return Some(fragment.to_owned());
+    }
+    let slug = slug(&percent_decode(fragment)?);
+    (!slug.is_empty()).then(|| format!("{HEADING_ID_PREFIX}{slug}"))
+}
+
+/// A path or wikilink target that may become an internal link.
+fn is_link_target(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_LINK_TARGET_CHARS
+        && !value.chars().any(char::is_control)
+}
+
+fn internal_href(scheme: &str, target: &str, fragment: Option<&str>) -> String {
+    let mut href = format!("{scheme}{}", percent_encode(target, true));
+    if let Some(id) = fragment.and_then(fragment_id) {
+        href.push('#');
+        href.push_str(&percent_encode(&id, false));
+    }
+    href
+}
+
+/// An in-page `#…` href exactly as `fragment_id` writes it.
+fn is_fragment_href(value: &str) -> bool {
+    is_footnote_id(value)
+        || percent_decode(value)
+            .is_some_and(|id| is_heading_id(&id) && percent_encode(&id, false) == value)
+}
+
+/// An `nb-doc:` or `nb-wiki:` href exactly as `internal_href` writes it.
+pub fn is_internal_href(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix(DOC_LINK_SCHEME)
+        .or_else(|| value.strip_prefix(WIKI_LINK_SCHEME))
+    else {
+        return false;
+    };
+    let (target, fragment) = rest
+        .split_once('#')
+        .map_or((rest, None), |(target, fragment)| (target, Some(fragment)));
+    percent_decode(target)
+        .is_some_and(|decoded| is_link_target(&decoded) && percent_encode(&decoded, true) == target)
+        && fragment.is_none_or(|id| !id.is_empty() && is_fragment_href(id))
+}
+
+/// The href a Markdown link gets, when it is not left to the sanitizer
+/// (web and mail links, and anything it refuses): `#Heading` targets the
+/// heading's id, a relative path or a wikilink becomes an internal link.
+/// An empty href is removed by the sanitizer.
+fn link_href(link_type: LinkType, dest: &str) -> Option<String> {
+    match link_type {
+        LinkType::Email => return None,
+        LinkType::WikiLink { .. } => return Some(wiki_href(dest).unwrap_or_default()),
+        _ => {}
+    }
+    if let Some(fragment) = dest.strip_prefix('#') {
+        return Some(
+            fragment_id(fragment)
+                .map_or_else(String::new, |id| format!("#{}", percent_encode(&id, false))),
+        );
+    }
+    if let Ok(url) = Url::parse(dest) {
+        // Only this module writes internal hrefs.
+        let internal = format!("{}:", url.scheme());
+        return [DOC_LINK_SCHEME, WIKI_LINK_SCHEME]
+            .contains(&internal.as_str())
+            .then(String::new);
+    }
+    // Protocol-relative (`//host`, `\\host`) is a web address, not a path.
+    if dest.starts_with("//") || dest.starts_with('\\') || dest.starts_with("/\\") {
+        return Some(String::new());
+    }
+    let (path, fragment) = dest
+        .split_once('#')
+        .map_or((dest, None), |(path, fragment)| (path, Some(fragment)));
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
+    let href = percent_decode(path)
+        .filter(|path| is_link_target(path))
+        .map(|path| internal_href(DOC_LINK_SCHEME, &path, fragment));
+    Some(href.unwrap_or_default())
+}
+
+/// `[[Note]]`, `[[Folder/Note#Heading]]` (pulldown-cmark drops `|alias`):
+/// the target as written, and the last `#` part as the heading
+/// (`[[Note#A#B]]` is B). `[[#Heading]]` is a heading of this document.
+fn wiki_href(dest: &str) -> Option<String> {
+    let (target, heading) = dest
+        .split_once('#')
+        .map_or((dest, None), |(target, heading)| {
+            (target, heading.rsplit('#').next())
+        });
+    let target = target.trim();
+    if target.is_empty() {
+        let id = fragment_id(heading?.trim())?;
+        return Some(format!("#{}", percent_encode(&id, false)));
+    }
+    is_link_target(target).then(|| internal_href(WIKI_LINK_SCHEME, target, heading.map(str::trim)))
+}
+
 fn is_allowed_href(value: &str) -> bool {
-    value.strip_prefix('#').is_some_and(is_footnote_id)
+    value.strip_prefix('#').is_some_and(is_fragment_href)
+        || is_internal_href(value)
         || Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "https" | "http" | "mailto"))
 }
 
@@ -115,6 +342,12 @@ static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             ("img", HashSet::from(["src", "alt", "title"])),
             ("input", HashSet::from(["checked"])),
             ("section", HashSet::from(["id"])),
+            ("h1", HashSet::from(["id"])),
+            ("h2", HashSet::from(["id"])),
+            ("h3", HashSet::from(["id"])),
+            ("h4", HashSet::from(["id"])),
+            ("h5", HashSet::from(["id"])),
+            ("h6", HashSet::from(["id"])),
         ]))
         .tag_attribute_values(HashMap::from([
             ("th", alignments.clone()),
@@ -132,7 +365,9 @@ static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             ),
             ("section", HashSet::from(["footnote-definition"])),
         ]))
-        .url_schemes(HashSet::from(["https", "http", "mailto", "data"]))
+        .url_schemes(HashSet::from([
+            "https", "http", "mailto", "data", "nb-doc", "nb-wiki",
+        ]))
         .url_relative(UrlRelative::PassThrough)
         .link_rel(Some("noopener noreferrer"))
         .strip_comments(true)
@@ -141,6 +376,7 @@ static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
                 ("img", "src") => is_inline_image(value),
                 (_, "href") => is_allowed_href(value),
                 ("section", "id") => is_footnote_id(value),
+                (tag, "id") if is_heading_tag(tag) => is_heading_id(value),
                 _ => true,
             };
             keep.then(|| value.into())
@@ -149,10 +385,14 @@ static SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
 });
 
 /// Rewrites parser events before HTML generation: raw HTML becomes text,
-/// non-inline images become placeholders, table cells carry `align`, and
-/// footnotes use numbered ids instead of document-controlled labels.
-struct Rewriter<I> {
+/// non-inline images become placeholders, table cells carry `align`,
+/// footnotes use numbered ids instead of document-controlled labels,
+/// headings get generated ids and links their app hrefs (`link_href`).
+struct Rewriter<'a, I> {
     events: I,
+    /// A heading's events, held back until its text has named it.
+    pending: VecDeque<Event<'a>>,
+    heading_ids: HeadingIds,
     footnotes: HashMap<String, usize>,
     alignments: Vec<Alignment>,
     in_table_head: bool,
@@ -166,10 +406,12 @@ struct Rewriter<I> {
     depth: usize,
 }
 
-impl<'a, I: Iterator<Item = Event<'a>>> Rewriter<I> {
+impl<'a, I: Iterator<Item = Event<'a>>> Rewriter<'a, I> {
     fn new(events: I) -> Self {
         Self {
             events,
+            pending: VecDeque::new(),
+            heading_ids: HeadingIds::default(),
             footnotes: HashMap::new(),
             alignments: Vec::new(),
             in_table_head: false,
@@ -281,6 +523,17 @@ impl<'a, I: Iterator<Item = Event<'a>>> Rewriter<I> {
                 )
             }
             Event::End(TagEnd::FootnoteDefinition) => Event::Html("</section>\n".into()),
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => Event::Start(Tag::Link {
+                link_type,
+                dest_url: link_href(link_type, &dest_url).map_or(dest_url, CowStr::from),
+                title,
+                id,
+            }),
             Event::Start(Tag::Table(ref alignments)) => {
                 self.alignments = alignments.clone();
                 event
@@ -316,10 +569,8 @@ impl<'a, I: Iterator<Item = Event<'a>>> Rewriter<I> {
     }
 }
 
-impl<'a, I: Iterator<Item = Event<'a>>> Iterator for Rewriter<I> {
-    type Item = Event<'a>;
-
-    fn next(&mut self) -> Option<Event<'a>> {
+impl<'a, I: Iterator<Item = Event<'a>>> Rewriter<'a, I> {
+    fn next_rewritten(&mut self) -> Option<Event<'a>> {
         loop {
             let event = self.events.next()?;
             if !self.within_nesting_limit(&event) {
@@ -328,6 +579,48 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for Rewriter<I> {
             if let Some(event) = self.rewrite(event) {
                 return Some(event);
             }
+        }
+    }
+
+    /// The start of a heading, with the id of its visible text (text and
+    /// code, not image alt text or footnote marks); its other events wait
+    /// in `pending`.
+    fn heading(&mut self, level: HeadingLevel) -> Event<'a> {
+        let mut text = String::new();
+        let mut image = 0_usize;
+        while let Some(event) = self.next_rewritten() {
+            let end = matches!(event, Event::End(TagEnd::Heading(_)));
+            match &event {
+                Event::Start(Tag::Image { .. }) => image += 1,
+                Event::End(TagEnd::Image) => image = image.saturating_sub(1),
+                Event::Text(value) | Event::Code(value) if image == 0 => text.push_str(value),
+                Event::SoftBreak | Event::HardBreak if image == 0 => text.push(' '),
+                _ => {}
+            }
+            self.pending.push_back(event);
+            if end {
+                break;
+            }
+        }
+        Event::Start(Tag::Heading {
+            level,
+            id: Some(self.heading_ids.next(&text).into()),
+            classes: Vec::new(),
+            attrs: Vec::new(),
+        })
+    }
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> Iterator for Rewriter<'a, I> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Event<'a>> {
+        if let Some(event) = self.pending.pop_front() {
+            return Some(event);
+        }
+        match self.next_rewritten()? {
+            Event::Start(Tag::Heading { level, .. }) => Some(self.heading(level)),
+            event => Some(event),
         }
     }
 }
@@ -468,6 +761,13 @@ mod tests {
                 if key == "href" {
                     assert!(is_allowed_href(value), "href {value} in {html}");
                 }
+                if key == "id" {
+                    let generated = match element.name.as_str() {
+                        "section" => is_footnote_id(value),
+                        tag => is_heading_tag(tag) && is_heading_id(value),
+                    };
+                    assert!(generated, "id {value} on {} in {html}", element.name);
+                }
             }
         }
         assert!(!html.to_ascii_lowercase().contains("<script"), "{html}");
@@ -571,8 +871,12 @@ mod tests {
             "[x](javascript:alert(1))",
             "[x](data:text/html,hi)",
             "[x](//evil.example/)",
-            "[x](relative.md)",
-            "[x](#not-a-footnote)",
+            "[x](\\\\evil.example/share)",
+            "[x](nb-doc:Notes/a.md)",
+            "[x](NB-WIKI:Note)",
+            "[x](#)",
+            "[x](#!!!)",
+            "[[ ]]",
         ] {
             let html = assert_safe(markdown);
             let links = elements(&html)
@@ -705,7 +1009,7 @@ mod tests {
             "# Title\n\nSome ~~old~~ **bold** and *em* text.\n\n> quote\n\n1. one\n2. two\n\n---\n\n```\ncode <b>\n```\n\nline  \nbreak",
         );
         for fragment in [
-            "<h1>Title</h1>",
+            "<h1 id=\"h-title\">Title</h1>",
             "<del>old</del>",
             "<strong>bold</strong>",
             "<em>em</em>",
@@ -756,5 +1060,285 @@ mod tests {
         assert!(result.is_err());
         let result = tauri::async_runtime::block_on(render_off_thread("*ok*".into()));
         assert_eq!(result.ok().as_deref(), Some("<p><em>ok</em></p>\n"));
+    }
+
+    fn hrefs(html: &str) -> Vec<Option<String>> {
+        elements(html)
+            .into_iter()
+            .filter(|e| e.name == "a")
+            .map(|e| e.get("href").map(str::to_owned))
+            .collect()
+    }
+
+    fn heading_ids(html: &str) -> Vec<String> {
+        elements(html)
+            .into_iter()
+            .filter(|e| is_heading_tag(&e.name))
+            .map(|e| e.get("id").unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn slugs_follow_github() {
+        for (text, expected) in [
+            ("Hello World", "hello-world"),
+            ("  What's new?  ", "--whats-new--"),
+            ("Tom & Jerry", "tom--jerry"),
+            ("snake_case and-dash", "snake_case-and-dash"),
+            ("Über Größe", "über-größe"),
+            ("Ünïcödé 日本語 Ελληνικά", "ünïcödé-日本語-ελληνικά"),
+            ("e\u{301}t\u{e9}", "\u{e9}t\u{e9}"),
+            ("Release 2.0 (beta)", "release-20-beta"),
+            ("<script>", "script"),
+            ("\"onclick=alert(1)", "onclickalert1"),
+            ("!!!", ""),
+            ("ΣΊΣΥΦΟΣ", "σίσυφος"),
+            ("ΟΔΟΣ", "οδος"),
+            ("ΟΔΟΣ ΣΤΟ ΣΠΙΤΙ", "οδος-στο-σπιτι"),
+            ("Σ", "σ"),
+        ] {
+            assert_eq!(slug(text), expected, "{text}");
+        }
+        assert_eq!(slug(&"a".repeat(500)).chars().count(), MAX_SLUG_CHARS);
+    }
+
+    #[test]
+    fn headings_get_unique_generated_ids() {
+        let html = assert_safe(
+            "# Intro\n\n## Intro\n\nIntro\n-----\n\n## Intro 1\n\n### `code` *and* [link](https://x.example)\n\n# Über\n\n# `__proto__`\n\n#\n\n> # Quoted",
+        );
+        assert_eq!(
+            heading_ids(&html),
+            [
+                "h-intro",
+                "h-intro-1",
+                "h-intro-2",
+                "h-intro-1-1",
+                "h-code-and-link",
+                "h-über",
+                "h-__proto__",
+                "h-",
+                "h-quoted",
+            ]
+        );
+        // Headings in code are not headings.
+        let html = assert_safe("```\n# not a heading\n```\n\n# Real");
+        assert_eq!(heading_ids(&html), ["h-real"]);
+    }
+
+    /// tests/unit/vault-links.test.mjs expects the same ids from outline.ts
+    /// labels (main.ts finds a fragment's editor line by them).
+    #[test]
+    fn heading_ids_keep_intraword_underscores_and_code() {
+        let html = assert_safe(
+            "## parse_config\n\n## snake_case_name\n\n## `parse_markdown()`\n\n## __proto__\n\n## a _b_ c\n\n## my__var\n\n## foo\\_bar\n\n## [`code`](https://x.example)\n\n## __init__.py\n\n## `__init__`\n\n## ΟΔΟΣ\n\n[a](#οδος) [b](#ΟΔΟΣ)",
+        );
+        assert_eq!(
+            heading_ids(&html),
+            [
+                "h-parse_config",
+                "h-snake_case_name",
+                "h-parse_markdown",
+                "h-proto",
+                "h-a-b-c",
+                "h-my__var",
+                "h-foo_bar",
+                "h-code",
+                "h-initpy",
+                "h-__init__",
+                "h-οδος",
+            ]
+        );
+        let greek = Some("#h-%CE%BF%CE%B4%CE%BF%CF%82".to_owned());
+        assert_eq!(hrefs(&html)[1..], [greek.clone(), greek]);
+    }
+
+    #[test]
+    fn heading_ids_ignore_image_alt_and_footnote_marks() {
+        let html = assert_safe(&format!(
+            "# Logo ![alt text]({PNG}) here[^1]\n\n# ![x](https://x.example/a.png) Blocked\n\n[^1]: note"
+        ));
+        assert_eq!(heading_ids(&html), ["h-logo--here", "h--blocked"]);
+    }
+
+    #[test]
+    fn documents_cannot_choose_ids() {
+        for markdown in [
+            "<h1 id=\"__proto__\">x</h1>",
+            "<h2 id=\"app\">clobber</h2>",
+            "<a id=\"settings\" name=\"x\">a</a>",
+            "# Title {#custom}",
+            "<section id=\"footnote-1\">fake</section>",
+        ] {
+            let html = assert_safe(markdown);
+            for element in elements(&html) {
+                if let Some(id) = element.get("id") {
+                    assert!(
+                        is_heading_tag(&element.name) && id.starts_with("h-"),
+                        "{html}"
+                    );
+                }
+            }
+        }
+        let html = assert_safe("# Title {#custom}");
+        assert_eq!(heading_ids(&html), ["h-title-custom"]);
+        // The sanitizer itself drops ids it did not generate.
+        let cleaned = SANITIZER
+            .clean("<h1 id=\"__proto__\">a</h1><h2 id=\"h-ok\">b</h2><h3 id=\"h-a b\">c</h3><p id=\"h-x\">d</p><section id=\"x\">e</section>")
+            .to_string();
+        assert_eq!(
+            cleaned,
+            "<h1>a</h1><h2 id=\"h-ok\">b</h2><h3>c</h3><p>d</p><section>e</section>"
+        );
+    }
+
+    #[test]
+    fn in_page_links_target_heading_ids() {
+        let html = assert_safe(
+            "# Größe & Maß\n\n[a](#größe--maß) [b](#Gr%C3%B6%C3%9Fe%20%26%20Ma%C3%9F) [c](<#Größe & Maß>) [d](#h-x) [e](#footnote-2)",
+        );
+        assert_eq!(
+            hrefs(&html),
+            [
+                Some("#h-gr%C3%B6%C3%9Fe--ma%C3%9F".into()),
+                Some("#h-gr%C3%B6%C3%9Fe--ma%C3%9F".into()),
+                Some("#h-gr%C3%B6%C3%9Fe--ma%C3%9F".into()),
+                Some("#h-h-x".into()),
+                Some("#footnote-2".into()),
+            ]
+        );
+        assert_eq!(heading_ids(&html), ["h-größe--maß"]);
+    }
+
+    #[test]
+    fn attack_fragments_stay_inert() {
+        for markdown in [
+            "[x](#%22onclick=alert(1))",
+            "[x](#%22%20onmouseover%3D%22alert(1))",
+            "[x](<#\" onclick=\"alert(1)>)",
+            "[x](#javascript:alert(1))",
+            "[x](#__proto__)",
+            "[x](#%00%0A)",
+            "[x](#%FF)",
+        ] {
+            let html = assert_safe(markdown);
+            for href in hrefs(&html).into_iter().flatten() {
+                let id = href.strip_prefix("#h-").expect("a heading href");
+                assert!(
+                    id.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_%".contains(&b)),
+                    "{html}"
+                );
+            }
+        }
+        let html = assert_safe("[x](#%22onclick=alert(1))");
+        assert_eq!(hrefs(&html), [Some("#h-onclickalert1".into())]);
+    }
+
+    #[test]
+    fn relative_links_become_vault_links() {
+        let html = assert_safe(
+            "[a](notes/other.md) [b](../a/b.md#Section%20Two) [c](Other%20Note.md?x=1#intro) [d](./My%20Folder/) [e](/top.html) [f](<with space.md>) [g](a%ZZ.md)",
+        );
+        assert_eq!(
+            hrefs(&html),
+            [
+                Some("nb-doc:notes/other.md".into()),
+                Some("nb-doc:../a/b.md#h-section-two".into()),
+                Some("nb-doc:Other%20Note.md#h-intro".into()),
+                Some("nb-doc:./My%20Folder/".into()),
+                Some("nb-doc:/top.html".into()),
+                Some("nb-doc:with%20space.md".into()),
+                Some("nb-doc:a%25ZZ.md".into()),
+            ]
+        );
+        // Not UTF-8 once decoded, control characters, or a scheme: no link.
+        for markdown in [
+            "[x](a%FF.md)",
+            "[x](a%0A.md)",
+            "[x](c:/x.md)",
+            "[x](tauri://localhost/)",
+        ] {
+            assert_eq!(hrefs(&assert_safe(markdown)), [None], "{markdown}");
+        }
+    }
+
+    #[test]
+    fn wikilinks_become_vault_links() {
+        let html = assert_safe(
+            "[[Note]] [[Folder/Other Note#Part One|alias]] [[Note#A#B]] [[#Local heading]] [[Café]]",
+        );
+        assert_eq!(
+            hrefs(&html),
+            [
+                Some("nb-wiki:Note".into()),
+                Some("nb-wiki:Folder/Other%20Note#h-part-one".into()),
+                Some("nb-wiki:Note#h-b".into()),
+                Some("#h-local-heading".into()),
+                Some("nb-wiki:Caf%C3%A9".into()),
+            ]
+        );
+        assert!(html.contains(">alias</a>"), "{html}");
+        assert!(html.contains(">Note</a>"), "{html}");
+        // An embed is an image: blocked like any other remote one.
+        let html = assert_safe("![[picture.png]]");
+        assert!(html.contains("Image blocked"), "{html}");
+    }
+
+    #[test]
+    fn wikilink_targets_cannot_reach_other_schemes() {
+        for markdown in [
+            "[[javascript:alert(1)]]",
+            "[[javascript:alert(1)|click]]",
+            "[[https://evil.example/]]",
+            "[[\"><script>alert(1)</script>]]",
+            "[[x\" onclick=\"alert(1)]]",
+        ] {
+            let html = assert_safe(markdown);
+            for href in hrefs(&html).into_iter().flatten() {
+                assert!(href.starts_with(WIKI_LINK_SCHEME), "{html}");
+                assert!(
+                    href.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._~/%:#".contains(&b)),
+                    "{html}"
+                );
+            }
+        }
+        assert_eq!(
+            hrefs(&assert_safe("[[javascript:alert(1)]]")),
+            [Some("nb-wiki:javascript%3Aalert%281%29".into())]
+        );
+    }
+
+    #[test]
+    fn only_canonical_internal_hrefs_pass() {
+        for valid in [
+            "nb-doc:a.md",
+            "nb-doc:../x/My%20Note.md#h-part",
+            "nb-wiki:Caf%C3%A9#h-caf%C3%A9",
+            "nb-doc:a.md#footnote-3",
+        ] {
+            assert!(is_internal_href(valid), "{valid}");
+        }
+        for invalid in [
+            "nb-doc:",
+            "nb-doc:a b.md",
+            "nb-doc:a%20.md#",
+            "nb-doc:a.md#x",
+            "nb-doc:a.md#h-a%20b",
+            "nb-doc:a%2fb.md",
+            "nb-doc:%0A",
+            "nb-doc:a.md#h-x#h-y",
+            "nb-wiki:javascript:alert(1)",
+            "nb-other:a.md",
+            "javascript:alert(1)",
+            "https://example.com",
+        ] {
+            assert!(!is_internal_href(invalid), "{invalid}");
+        }
+        assert!(!is_internal_href(&format!(
+            "nb-doc:{}",
+            "a".repeat(MAX_LINK_TARGET_CHARS + 1)
+        )));
     }
 }

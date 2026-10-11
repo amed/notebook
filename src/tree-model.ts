@@ -1,10 +1,18 @@
 // The sidebar tree as data: nodes by id, sorted children, paths and search.
 // Indexes are rebuilt only when the nodes change (a snapshot or a delta), and
-// deltas apply in version order. No DOM, so tests/unit can run it.
-import { kindName, type TreeDelta, type TreeNode, type TreeSnapshot } from "./ipc";
+// deltas apply in version order. No DOM and no runtime imports, so
+// tests/unit can run it.
+import type { NodeKindName, TreeDelta, TreeNode, TreeSnapshot } from "./ipc";
 
 export const ROOT_ID = "00000000-0000-0000-0000-000000000001";
 export const TRASH_ID = "00000000-0000-0000-0000-000000000002";
+
+/** The kind of `node`; Rust sends a unit variant as a string, others as an object. */
+export function kindName(node: TreeNode): NodeKindName {
+  if (typeof node.kind === "string") return node.kind;
+  const first = Object.keys(node.kind)[0];
+  return (first as NodeKindName | undefined) ?? "Document";
+}
 
 /** A row of the sidebar: a folder or document and its indentation. */
 export type TreeItem = { node: TreeNode; depth: number };
@@ -36,13 +44,30 @@ export class TreeModel {
   private index: Index | null = null;
   /** Deltas that arrived before the one they follow, by their `from`. */
   private waiting = new Map<number, TreeDelta>();
+  /** Bumped by every change of the nodes; `drawn` is its value at the last draw. */
+  private revision = 0;
+  private drawn = 0;
 
   replace(snapshot: TreeSnapshot): void {
     this.byId = new Map(snapshot.nodes.map((node) => [node.id, node]));
     this.version = snapshot.version ?? 0;
     for (const [from, delta] of this.waiting) if (delta.to <= this.version || from < this.version) this.waiting.delete(from);
-    this.index = null;
+    this.changed();
     this.drain();
+  }
+
+  /**
+   * The nodes changed since the sidebar was last drawn (its rows and the
+   * Trash count). A change applied without drawing, to draw once after
+   * following it, is still drawn when that path only moves the selection.
+   */
+  get needsDraw(): boolean {
+    return this.revision !== this.drawn;
+  }
+
+  /** The sidebar now shows these nodes. */
+  markDrawn(): void {
+    this.drawn = this.revision;
   }
 
   /**
@@ -71,7 +96,7 @@ export class TreeModel {
   change(upsert: TreeNode[], remove: string[] = []): void {
     for (const id of remove) this.byId.delete(id);
     for (const node of upsert) this.byId.set(node.id, node);
-    this.index = null;
+    this.changed();
   }
 
   get(id: string | null | undefined): TreeNode | undefined {
@@ -166,7 +191,12 @@ export class TreeModel {
     for (const id of delta.remove) this.byId.delete(id);
     for (const node of delta.upsert) this.byId.set(node.id, node);
     this.version = delta.to;
+    this.changed();
+  }
+
+  private changed(): void {
     this.index = null;
+    this.revision++;
   }
 
   private drain(): void {

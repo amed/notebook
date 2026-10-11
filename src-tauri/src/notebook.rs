@@ -17,14 +17,20 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Manager as _, State};
 use url::Url;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+mod doc_windows;
 mod layout;
 mod workspaces;
+pub use doc_windows::{
+    DOCUMENT_WINDOW_PREFIX, DocumentWindowInfo, HeldDocument, HeldMove, HoldNotice, Holding,
+    MAIN_WINDOW, is_document_window,
+};
 use layout::PanelLayout;
 use workspaces::{AppConfig, Keychain};
 
@@ -408,6 +414,8 @@ pub struct NotebookState {
     uploads: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// One refresh (full listing) at a time.
     refreshing: tokio::sync::Mutex<()>,
+    /// Which window writes which document (`doc_windows.rs`). A leaf lock.
+    holds: Mutex<doc_windows::Holds>,
 }
 
 impl NotebookState {
@@ -518,6 +526,7 @@ impl NotebookState {
             journal: Mutex::new(Journal::default()),
             uploads: Mutex::new(HashMap::new()),
             refreshing: tokio::sync::Mutex::new(()),
+            holds: Mutex::new(doc_windows::Holds::default()),
         }
     }
 
@@ -725,7 +734,7 @@ pub struct TreeSnapshot {
 
 /// What a change did to the tree: version `from` becomes `to` after removing
 /// `remove` and inserting or replacing `upsert`. `from == to`: no change.
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct TreeDelta {
     from: u64,
     to: u64,
@@ -748,8 +757,10 @@ pub struct TrashResult {
 
 #[derive(Serialize)]
 pub struct OpenDocument {
-    text: String,
-    rev: u64,
+    /// None when the caller already holds this text (`known_rev`).
+    text: Option<String>,
+    /// The text's SHA-256 (hex): what the caller passes back as `known_rev`.
+    rev: String,
     read_only: bool,
     rollback_warning: bool,
     /// The text is an edit from the outbox that S3 does not hold yet.
@@ -800,6 +811,9 @@ struct S3Remote {
     bucket: Bucket,
     credentials: S3Credentials,
     client: Client,
+    /// Cleared once S3 refuses DeleteObjects: the rest of the session deletes
+    /// Trash objects one request each instead of failing the same way again.
+    batch_delete: AtomicBool,
 }
 
 /// A complete S3 response: status, ETag and the whole body.
@@ -893,6 +907,7 @@ impl S3Remote {
             bucket,
             credentials,
             client,
+            batch_delete: AtomicBool::new(true),
         })
     }
 
@@ -970,7 +985,7 @@ impl S3Remote {
             let reply = self
                 .send(build, 0, MAX_LIST_RESPONSE_BYTES, too_large)
                 .await?;
-            check_status(reply.status)?;
+            check_reply(&reply)?;
             let body =
                 std::str::from_utf8(&reply.body).map_err(|_| IpcError::internal("S3_RESPONSE"))?;
             let parsed = rusty_s3::actions::ListObjectsV2::parse_response(body)
@@ -1009,7 +1024,7 @@ impl S3Remote {
                 "The S3 object no longer exists.",
             ));
         }
-        check_status(reply.status)?;
+        check_reply(&reply)?;
         Ok(ObjectBody {
             bytes: reply.body,
             etag: reply.etag,
@@ -1046,7 +1061,7 @@ impl S3Remote {
                 IpcError::internal("S3_RESPONSE"),
             )
             .await?;
-        check_status(reply.status)?;
+        check_reply(&reply)?;
         Ok(reply.etag)
     }
 
@@ -1065,7 +1080,7 @@ impl S3Remote {
         let reply = self
             .send(build, 0, MAX_REPLY_BYTES, IpcError::internal("S3_RESPONSE"))
             .await?;
-        check_status(reply.status)
+        check_reply(&reply)
     }
 
     /// CopyObject: S3 copies `source` (only while its ETag is `etag`) to
@@ -1094,7 +1109,7 @@ impl S3Remote {
                 "The S3 object no longer exists.",
             ));
         }
-        check_status(reply.status)?;
+        check_reply(&reply)?;
         // CopyObject can fail after answering 200: the error is in the body.
         let body = String::from_utf8_lossy(&reply.body);
         if body.contains("<Error>") {
@@ -1106,43 +1121,167 @@ impl S3Remote {
         xml_text(&body, "ETag").ok_or_else(|| IpcError::internal("S3_RESPONSE"))
     }
 
+    /// Whether DeleteObjects is still worth trying in this session.
+    fn batch_delete_available(&self) -> bool {
+        self.batch_delete.load(Ordering::Relaxed)
+    }
+
+    /// From now on this session deletes Trash objects one request each. Logs
+    /// only the status and S3's error code: never a key, path or secret.
+    fn disable_batch_delete(&self, status: StatusCode, code: &str) {
+        if self.batch_delete.swap(false, Ordering::Relaxed) {
+            tracing::warn!(
+                status = status.as_u16(),
+                code,
+                "S3 refused DeleteObjects; this session deletes Trash objects one by one"
+            );
+        }
+    }
+
     /// DeleteObjects in quiet mode: one request for up to 1,000 keys, without
-    /// per-object conditions (used only for Trash contents). Returns the keys
-    /// S3 reported as not deleted.
-    async fn delete_batch(&self, keys: &[String]) -> Result<Vec<String>, IpcError> {
+    /// per-object conditions (used only for Trash contents), shaped as AWS
+    /// documents it (see [`delete_objects_url`]).
+    async fn delete_batch(&self, keys: &[String]) -> Result<BatchOutcome, IpcError> {
         let objects = keys
             .iter()
             .map(|key| ObjectIdentifier::new(key.clone()))
             .collect::<Vec<_>>();
+        let mut action = self
+            .bucket
+            .delete_objects(Some(&self.credentials), objects.iter());
+        action.set_quiet(true);
+        let (body, md5) = action.body_with_md5();
         let build = || {
-            let mut action = self
-                .bucket
-                .delete_objects(Some(&self.credentials), objects.iter());
-            action.set_quiet(true);
-            let url = action.sign(SIGNED_URL_TTL);
-            let (body, md5) = action.body_with_md5();
+            let url = delete_objects_url(
+                &self.bucket,
+                &self.credentials,
+                &md5,
+                &jiff::Timestamp::now(),
+            );
             self.client
                 .post(url)
-                .header("content-md5", md5)
-                .header("content-type", "application/xml")
-                .body(body)
+                .header("content-md5", md5.as_str())
+                .header("content-type", DELETE_OBJECTS_TYPE)
+                .body(body.clone())
         };
         let reply = self
             .send(
                 build,
-                keys.iter().map(|key| key.len() + 32).sum(),
+                body.len(),
                 MAX_LIST_RESPONSE_BYTES,
                 IpcError::internal("S3_RESPONSE"),
             )
             .await?;
-        check_status(reply.status)?;
-        let body = String::from_utf8_lossy(&reply.body);
-        Ok(body
+        delete_batch_outcome(&reply)
+    }
+}
+
+/// The content type of a DeleteObjects body, signed with it.
+const DELETE_OBJECTS_TYPE: &str = "application/xml";
+
+/// The presigned URL of a DeleteObjects request, exactly as the AWS SDKs
+/// send it: `POST /?delete` (rusty-s3's own action adds `delete=1`, a form AWS
+/// does not document), with the body's `Content-MD5` and `Content-Type`
+/// signed next to `host`. AWS's SigV4 signer (aws-sigv4) computes the same
+/// signature for this request; a unit test pins one.
+fn delete_objects_url(
+    bucket: &Bucket,
+    credentials: &S3Credentials,
+    content_md5: &str,
+    time: &jiff::Timestamp,
+) -> Url {
+    let headers = [
+        ("content-md5", content_md5),
+        ("content-type", DELETE_OBJECTS_TYPE),
+    ];
+    rusty_s3::signing::sign(
+        time,
+        rusty_s3::Method::Post,
+        bucket.base_url().clone(),
+        credentials.key(),
+        credentials.secret(),
+        credentials.token(),
+        bucket.region(),
+        SIGNED_URL_TTL.as_secs(),
+        std::iter::once(("delete", "")),
+        headers.into_iter(),
+    )
+}
+
+/// What one DeleteObjects request achieved.
+#[derive(Debug, PartialEq)]
+enum BatchOutcome {
+    /// S3 processed the list: the keys it reported as not deleted, each with
+    /// S3's error code. Every other key is gone.
+    Processed(Vec<(String, String)>),
+    /// S3 refused the request as a whole (status and S3 error code, empty
+    /// when the body named none), so nothing was deleted.
+    Refused(StatusCode, String),
+}
+
+/// Reads a DeleteObjects reply. Statuses a single DeleteObject may still
+/// pass (the endpoint, a policy or the request shape refuses the batch) are
+/// `Refused`; errors every request of this session would get are errors.
+fn delete_batch_outcome(reply: &Reply) -> Result<BatchOutcome, IpcError> {
+    let body = String::from_utf8_lossy(&reply.body);
+    let code = s3_error_code(&body);
+    if !reply.status.is_success() {
+        return match reply.status.as_u16() {
+            400 | 401 | 403 | 405 | 411 | 501 if !credential_code(&code) => {
+                Ok(BatchOutcome::Refused(reply.status, code))
+            }
+            _ => Err(s3_error(reply.status, &reply.body)),
+        };
+    }
+    // A 200 can still carry a request-level error (MalformedXML, for one), or
+    // no result at all from an endpoint that ignored the request: both deleted
+    // nothing that can be relied on.
+    let Some(start) = body.find("<DeleteResult") else {
+        return Ok(BatchOutcome::Refused(reply.status, code));
+    };
+    Ok(BatchOutcome::Processed(
+        body[start..]
             .split("<Error>")
             .skip(1)
-            .filter_map(|error| xml_text(error.split("</Error>").next()?, "Key"))
-            .collect())
-    }
+            .filter_map(|error| {
+                let error = error.split("</Error>").next()?;
+                Some((xml_text(error, "Key")?, s3_error_code(error)))
+            })
+            .collect(),
+    ))
+}
+
+/// S3's error `<Code>` in `xml`: letters and digits only (anything else is
+/// dropped), so it can be logged and matched but never carries a key or
+/// S3's message text.
+fn s3_error_code(xml: &str) -> String {
+    xml_text(xml, "Code")
+        .filter(|code| code.len() <= 64 && code.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .unwrap_or_default()
+}
+
+/// Error codes that a later request can pass: a refusal with one of them
+/// does not end batch deletes for the session.
+fn transient_code(code: &str) -> bool {
+    matches!(
+        code,
+        "InternalError" | "SlowDown" | "ServiceUnavailable" | "OperationAborted" | "RequestTimeout"
+    )
+}
+
+/// Error codes every request with these credentials or this bucket gets:
+/// deleting one by one cannot help.
+fn credential_code(code: &str) -> bool {
+    matches!(
+        code,
+        "InvalidAccessKeyId"
+            | "RequestTimeTooSkewed"
+            | "ExpiredToken"
+            | "InvalidToken"
+            | "TokenRefreshRequired"
+            | "AccountProblem"
+            | "NoSuchBucket"
+    )
 }
 
 /// Percent-encodes a key for `x-amz-copy-source`, as Notebook does.
@@ -1219,8 +1358,10 @@ struct ListedObject {
     etag: String,
 }
 
+/// 501 Not Implemented is a server status but never passes on a retry.
 fn retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+    status == StatusCode::TOO_MANY_REQUESTS
+        || (status.is_server_error() && status != StatusCode::NOT_IMPLEMENTED)
 }
 
 async fn retry_pause(attempt: usize) {
@@ -1229,6 +1370,51 @@ async fn retry_pause(attempt: usize) {
     let _ = getrandom::fill(&mut random);
     let jitter_ms = u64::from(u16::from_le_bytes(random)) % 250;
     tokio::time::sleep(Duration::from_millis((base_ms + jitter_ms).min(30_000))).await;
+}
+
+/// A reply's outcome: success, or the error its status and S3's error code
+/// (never S3's message text) describe.
+fn check_reply(reply: &Reply) -> Result<(), IpcError> {
+    if reply.status.is_success() {
+        Ok(())
+    } else {
+        Err(s3_error(reply.status, &reply.body))
+    }
+}
+
+/// The error for a failed S3 reply. A few S3 error codes have a more useful
+/// message than their status; everything else maps by status.
+fn s3_error(status: StatusCode, body: &[u8]) -> IpcError {
+    match s3_error_code(&String::from_utf8_lossy(body)).as_str() {
+        "SignatureDoesNotMatch" => IpcError::new(
+            "SIGNATURE_MISMATCH",
+            "S3 rejected the request signature. Check the secret access key.",
+        ),
+        "RequestTimeTooSkewed" => IpcError::new(
+            "CLOCK_SKEW",
+            "This computer's clock differs too much from S3's. Correct the date and time, then try again.",
+        ),
+        "InvalidAccessKeyId" => IpcError::new(
+            "ACCESS_DENIED",
+            "S3 does not recognize the access key ID. Check the credentials.",
+        ),
+        "ExpiredToken" | "InvalidToken" | "TokenRefreshRequired" => IpcError::new(
+            "ACCESS_DENIED",
+            "The S3 session token has expired or is invalid. Update the credentials.",
+        ),
+        "NoSuchBucket" => IpcError::new(
+            "NO_SUCH_BUCKET",
+            "The bucket was not found. Check the bucket name and region.",
+        ),
+        "InvalidRequest" | "InvalidArgument" | "MalformedXML" | "MissingContentMD5"
+        | "InvalidDigest" | "BadDigest" => IpcError::new(
+            "S3_REJECTED",
+            "S3 rejected the request. The endpoint may not support this operation.",
+        ),
+        _ => check_status(status)
+            .err()
+            .unwrap_or_else(|| IpcError::internal("S3_REQUEST")),
+    }
 }
 
 fn check_status(status: StatusCode) -> Result<(), IpcError> {
@@ -1812,7 +1998,11 @@ fn validate_name(name: &str) -> Result<String, IpcError> {
             "That name is reserved for deleted items.",
         ));
     }
-    if value.contains(['/', '\\', '\0']) || matches!(value, "." | ".." | DIRECTORY_MARKER) {
+    // Control characters (newlines, tabs, C1) would forge lines in dialogs.
+    if value.contains(['/', '\\', '\0'])
+        || value.chars().any(char::is_control)
+        || matches!(value, "." | ".." | DIRECTORY_MARKER)
+    {
         return Err(IpcError::invalid(
             "That name is reserved or contains an invalid character.",
         ));
@@ -2122,16 +2312,6 @@ fn masked_access_key_id(value: &str) -> String {
     }
 }
 
-#[tauri::command]
-pub async fn connection_test(state: State<'_, NotebookState>) -> Result<&'static str, IpcError> {
-    let (_, config, credentials) = workspaces::active_credentials(&state)?;
-    let found = !S3Remote::new(&config, &credentials)?
-        .list(list_prefix(&config).as_deref())
-        .await?
-        .is_empty();
-    Ok(if found { "VaultFound" } else { "NoVault" })
-}
-
 /// Unlocks the active workspace. Without `passphrase` the remembered phrase is
 /// used (`NO_STORED_PHRASE` when there is none). After a successful unlock,
 /// `remember: true` stores the typed phrase and `remember: false` forgets the
@@ -2139,11 +2319,14 @@ pub async fn connection_test(state: State<'_, NotebookState>) -> Result<&'static
 /// phrase fails before anything is stored, so it never replaces a stored one.
 #[tauri::command]
 pub async fn vault_unlock(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
     passphrase: Option<String>,
     remember: Option<bool>,
 ) -> Result<TreeSnapshot, IpcError> {
-    unlock(&state, passphrase, remember).await
+    let result = unlock(&state, passphrase, remember).await;
+    crate::window::close_stale_document_windows(&app);
+    result
 }
 
 async fn unlock(
@@ -2194,20 +2377,31 @@ async fn unlock(
     Ok(result)
 }
 
+/// The page closes its document windows first (`document_windows_close`);
+/// any left are closed here, since their session ends.
 #[tauri::command]
-pub fn vault_lock(state: State<'_, NotebookState>) -> Result<(), IpcError> {
+pub fn vault_lock(app: tauri::AppHandle, state: State<'_, NotebookState>) -> Result<(), IpcError> {
     state.forget_journal();
-    let mut inner = state
-        .inner
-        .lock()
-        .map_err(|_| IpcError::internal("STATE"))?;
-    inner.session = None;
-    inner.idle_notified = false;
+    {
+        let mut inner = state
+            .inner
+            .lock()
+            .map_err(|_| IpcError::internal("STATE"))?;
+        inner.session = None;
+        inner.idle_notified = false;
+    }
+    crate::window::close_stale_document_windows(&app);
     Ok(())
 }
 
+/// Typing in a document window keeps the workspace open too: the main
+/// window, which runs the idle lock, is told.
 #[tauri::command]
-pub fn activity_ping(state: State<'_, NotebookState>) -> Result<(), IpcError> {
+pub fn activity_ping(
+    app: tauri::AppHandle,
+    state: State<'_, NotebookState>,
+    window: tauri::WebviewWindow,
+) -> Result<(), IpcError> {
     let mut inner = state
         .inner
         .lock()
@@ -2215,6 +2409,11 @@ pub fn activity_ping(state: State<'_, NotebookState>) -> Result<(), IpcError> {
     if inner.session.is_some() {
         inner.last_activity = Instant::now();
         inner.idle_notified = false;
+        drop(inner);
+        if window.label() != MAIN_WINDOW {
+            use tauri::Emitter as _;
+            let _ = app.emit_to(MAIN_WINDOW, "window-activity", ());
+        }
     }
     Ok(())
 }
@@ -2681,31 +2880,64 @@ fn forget_keys(state: &NotebookState, session: u64, keys: &[String]) {
     }
 }
 
+/// `known_rev`: the rev of the text the caller's editor still holds for
+/// `id`; when it is the text's, the reply leaves the text out (a switch
+/// back to a 12 MB document sends 13 MB less).
 #[tauri::command]
 pub async fn doc_open(
     state: State<'_, NotebookState>,
+    window: tauri::WebviewWindow,
     id: String,
+    known_rev: Option<String>,
 ) -> Result<OpenDocument, IpcError> {
-    open_document(&state, &id).await
+    open_document_known(&state, &id, window.label(), known_rev.as_deref()).await
+}
+
+async fn open_document(state: &NotebookState, id: &str) -> Result<OpenDocument, IpcError> {
+    open_document_as(state, id, MAIN_WINDOW).await
+}
+
+async fn open_document_as(
+    state: &NotebookState,
+    id: &str,
+    window: &str,
+) -> Result<OpenDocument, IpcError> {
+    open_document_known(state, id, window, None).await
+}
+
+/// The rev of a text with SHA-256 `sha`.
+fn text_rev(sha: &[u8; 32]) -> String {
+    hex::encode(sha)
 }
 
 /// Answers without a request when it can: a staged edit (dirty), then the
 /// cached text of the version the map holds; otherwise S3's version is
-/// downloaded. The version returned becomes the base of the next edits.
-async fn open_document(state: &NotebookState, id: &str) -> Result<OpenDocument, IpcError> {
+/// downloaded. The version returned becomes the base of the next edits,
+/// for the writer only. `read_only`: another window writes the document
+/// (`doc_windows.rs`).
+async fn open_document_known(
+    state: &NotebookState,
+    id: &str,
+    window: &str,
+    known_rev: Option<&str>,
+) -> Result<OpenDocument, IpcError> {
     let target = document_target(state, id)?;
-    let opened = |text: String, dirty: bool| OpenDocument {
-        text,
-        rev: 1,
-        read_only: false,
-        rollback_warning: false,
-        dirty,
+    let writable = state.check_reader(target.session, id, window)?;
+    let opened = |text: &str, sha: &[u8; 32], dirty: bool| {
+        let rev = text_rev(sha);
+        OpenDocument {
+            text: (known_rev != Some(rev.as_str())).then(|| text.to_owned()),
+            rev,
+            read_only: !writable,
+            rollback_warning: false,
+            dirty,
+        }
     };
     {
         let mut journal = journal_of(state, target.session)?.ok_or_else(IpcError::locked)?;
         let entry = journal.keys.entry(target.key.clone()).or_default();
         if let Some(staged) = entry.staged.as_ref() {
-            return Ok(opened(staged.text.as_str().to_owned(), true));
+            return Ok(opened(staged.text.as_str(), &staged.sha, true));
         }
         let cached = state
             .inner
@@ -2716,49 +2948,95 @@ async fn open_document(state: &NotebookState, id: &str) -> Result<OpenDocument, 
             .filter(|session| session.id == target.session)
             .and_then(|session| session.cache.get(&target.key, &target.etag));
         if let Some((text, sha)) = cached {
-            if !entry.committing {
+            // Only the writer moves the base: it is the If-Match of the
+            // writer's next upload, and a reader's newer version must not
+            // let that upload overwrite another device's change.
+            if writable && !entry.committing {
                 entry.base = Some((target.etag.clone(), sha));
             }
-            return Ok(opened(text.as_str().to_owned(), false));
+            return Ok(opened(text.as_str(), &sha, false));
         }
     }
     let object = target.remote.get(&target.key).await?;
     let text = decrypt_document(&target.codec, &object.bytes)?;
+    let sha = text_digest(&text);
     if let Some(etag) = object.etag {
         let shared = Arc::new(Zeroizing::new(text.clone()));
-        let sha = text_digest(&text);
         // A session that ended while S3 answered gets nothing of this one.
         let mut journal = journal_of(state, target.session)?.ok_or_else(IpcError::locked)?;
         let entry = journal.keys.entry(target.key.clone()).or_default();
         if entry.staged.is_none() && !entry.committing {
-            entry.base = Some((etag.clone(), sha));
+            if writable {
+                entry.base = Some((etag.clone(), sha));
+            }
             record_version(state, target.session, &target.key, &etag, shared, sha);
         }
     }
-    Ok(opened(text, false))
+    let rev = text_rev(&sha);
+    Ok(OpenDocument {
+        text: (known_rev != Some(rev.as_str())).then_some(text),
+        rev,
+        read_only: !writable,
+        rollback_warning: false,
+        dirty: false,
+    })
+}
+
+#[derive(Serialize)]
+pub struct StageResult {
+    status: &'static str,
+    /// The staged text's rev, as `doc_open` gives it.
+    rev: String,
 }
 
 #[tauri::command]
 pub async fn doc_stage(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     id: String,
     text: String,
-) -> Result<&'static str, IpcError> {
+) -> Result<StageResult, IpcError> {
+    let label = window.label().to_owned();
     // Encrypting and fsyncing take milliseconds, off the async workers.
-    tauri::async_runtime::spawn_blocking(move || {
-        stage_document(&app.state::<NotebookState>(), &id, text)
+    let (status, sha) = tauri::async_runtime::spawn_blocking(move || {
+        stage_document_sha(&app.state::<NotebookState>(), &id, text, &label)
     })
     .await
-    .map_err(|_| IpcError::internal("STAGE"))?
+    .map_err(|_| IpcError::internal("STAGE"))??;
+    Ok(StageResult {
+        status,
+        rev: text_rev(&sha),
+    })
+}
+
+fn stage_document(state: &NotebookState, id: &str, text: String) -> Result<&'static str, IpcError> {
+    stage_document_as(state, id, text, MAIN_WINDOW)
 }
 
 /// Writes `text` to the encrypted outbox (fsynced) as the newest edit of
 /// `id`, without any S3 request. "Clean" when the text equals the version it
-/// is based on (any queued edit is dropped), otherwise "Staged".
-fn stage_document(state: &NotebookState, id: &str, text: String) -> Result<&'static str, IpcError> {
+/// is based on (any queued edit is dropped), otherwise "Staged". Only the
+/// window that writes `id` may stage it (`NOT_WRITER`).
+fn stage_document_as(
+    state: &NotebookState,
+    id: &str,
+    text: String,
+    window: &str,
+) -> Result<&'static str, IpcError> {
+    stage_document_sha(state, id, text, window).map(|(status, _)| status)
+}
+
+/// `stage_document_as`, with the SHA-256 of the text.
+fn stage_document_sha(
+    state: &NotebookState,
+    id: &str,
+    text: String,
+    window: &str,
+) -> Result<(&'static str, [u8; 32]), IpcError> {
     let text = Zeroizing::new(text);
     validate_document_size(&text)?;
     let target = document_target(state, id)?;
+    state.check_writer(target.session, id, window)?;
     let sha = text_digest(&text);
     {
         let mut journal = journal_of(state, target.session)?.ok_or_else(IpcError::locked)?;
@@ -2768,13 +3046,13 @@ fn stage_document(state: &NotebookState, id: &str, text: String) -> Result<&'sta
             .as_ref()
             .is_some_and(|staged| staged.sha == sha)
         {
-            return Ok("Staged");
+            return Ok(("Staged", sha));
         }
         if !entry.committing && entry.base.as_ref().is_some_and(|(_, base)| *base == sha) {
             if entry.staged.take().is_some() {
                 remove_outbox(state, &target.config, &target.key);
             }
-            return Ok("Clean");
+            return Ok(("Clean", sha));
         }
     }
     let body = target
@@ -2783,6 +3061,11 @@ fn stage_document(state: &NotebookState, id: &str, text: String) -> Result<&'sta
         .map_err(|_| IpcError::internal("ENCRYPT_CONTENT"))?
         .to_vec();
     let mut journal = journal_of(state, target.session)?.ok_or_else(IpcError::locked)?;
+    // Again under the journal lock: a rename, move or Trash freezes the
+    // holders before `commit_subtree` reads the staged keys under it, so an
+    // edit is either uploaded before the move or refused (`BUSY`), never
+    // left at a key that disappears (`holds` is a leaf lock).
+    state.check_writer(target.session, id, window)?;
     journal.next_gen += 1;
     let generation = journal.next_gen;
     let entry = journal.keys.entry(target.key.clone()).or_default();
@@ -2798,16 +3081,50 @@ fn stage_document(state: &NotebookState, id: &str, text: String) -> Result<&'sta
         body: Arc::new(body),
         expected,
     });
-    Ok("Staged")
+    Ok(("Staged", sha))
 }
 
+/// A document window's commit tells the main window, which shows that
+/// document read-only and re-reads it (from the cache, no S3 request).
 #[tauri::command]
 pub async fn doc_commit(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
+    window: tauri::WebviewWindow,
     id: String,
 ) -> Result<SaveResult, IpcError> {
-    let target = document_target(&state, &id)?;
-    commit_key(&state, target.session, &target.key).await
+    let label = window.label();
+    let result = commit_document_as(&state, &id, label).await?;
+    if label != MAIN_WINDOW {
+        crate::window::after_document_commit(
+            &app,
+            label,
+            &id,
+            result.conflict_copy(),
+            result.tree.clone(),
+        );
+    }
+    Ok(result)
+}
+
+/// Only the window that writes `id` may upload it (`NOT_WRITER`).
+async fn commit_document_as(
+    state: &NotebookState,
+    id: &str,
+    window: &str,
+) -> Result<SaveResult, IpcError> {
+    let target = document_target(state, id)?;
+    state.check_writer(target.session, id, window)?;
+    commit_key(state, target.session, &target.key).await
+}
+
+impl SaveResult {
+    /// The conflict copy the edit became, if it did.
+    fn conflict_copy(&self) -> Option<&str> {
+        self.document_id
+            .as_deref()
+            .filter(|_| self.status == "ConflictCopy")
+    }
 }
 
 fn save_result(status: &'static str) -> SaveResult {
@@ -3246,31 +3563,68 @@ async fn delete_objects(
     )
 }
 
-/// Deletes `(path, key)` objects without conditions, 1,000 per DeleteObjects
-/// request: only for Trash contents. Returns the paths that are gone.
+/// One bin entry's place in storage, for the order of single deletes.
+struct EntryArea {
+    /// Every object of the entry is below this prefix (ends with "/").
+    storage_prefix: String,
+    /// The deleted item itself; its existence keeps the entry listed.
+    root_path: String,
+}
+
+impl EntryArea {
+    fn of(entry: &BinEntry) -> Self {
+        Self {
+            storage_prefix: entry.storage_prefix.clone(),
+            root_path: entry.root_path.clone(),
+        }
+    }
+}
+
+/// Deletes `(path, key)` objects without conditions: only for Trash contents.
+/// Up to 1,000 go in one DeleteObjects request. Keys a batch did not delete,
+/// and every key once S3 refused DeleteObjects in this session, are deleted
+/// one request each, `PARALLEL` at a time: exactly the keys given, nothing
+/// else. Single deletes take an entry's markers first and its item last, so
+/// a failure leaves the item, the entry stays in Trash and a retry can
+/// finish it. Returns the paths that are gone and the first error.
 async fn delete_in_batches(
-    remote: &S3Remote,
+    remote: &Arc<S3Remote>,
     objects: Vec<(String, String)>,
+    entries: &[EntryArea],
 ) -> (Vec<String>, Result<(), IpcError>) {
     let mut gone = Vec::new();
     let mut result = Ok(());
+    let mut singly = Vec::new();
     for batch in objects.chunks(1_000) {
+        if !remote.batch_delete_available() {
+            singly.extend_from_slice(batch);
+            continue;
+        }
         let keys = batch.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
         match remote.delete_batch(&keys).await {
-            Ok(failed) => {
-                let failed = failed.into_iter().collect::<HashSet<_>>();
-                gone.extend(
-                    batch
-                        .iter()
-                        .filter(|(_, key)| !failed.contains(key))
-                        .map(|(path, _)| path.clone()),
-                );
-                if !failed.is_empty() && result.is_ok() {
-                    result = Err(IpcError::new(
-                        "S3_UNAVAILABLE",
-                        "S3 did not delete every object. Try again.",
-                    ));
+            Ok(BatchOutcome::Processed(failed)) => {
+                let failed = failed
+                    .iter()
+                    .map(|(key, code)| (key.as_str(), code.as_str()))
+                    .collect::<HashMap<_, _>>();
+                for (path, key) in batch {
+                    match failed.get(key.as_str()) {
+                        // S3 confirms a missing key as deleted; NoSuchKey too.
+                        None | Some(&"NoSuchKey") => gone.push(path.clone()),
+                        Some(code) => {
+                            if !transient_code(code) {
+                                remote.disable_batch_delete(StatusCode::OK, code);
+                            }
+                            singly.push((path.clone(), key.clone()));
+                        }
+                    }
                 }
+            }
+            Ok(BatchOutcome::Refused(status, code)) => {
+                if !transient_code(&code) {
+                    remote.disable_batch_delete(status, &code);
+                }
+                singly.extend_from_slice(batch);
             }
             Err(error) => {
                 if result.is_ok() {
@@ -3279,7 +3633,123 @@ async fn delete_in_batches(
             }
         }
     }
+    if !singly.is_empty() {
+        let (deleted, outcome) = delete_entries_singly(remote, singly, entries).await;
+        gone.extend(deleted);
+        if result.is_ok() {
+            result = outcome;
+        }
+    }
     (gone, result)
+}
+
+/// Single deletes in two waves. Notebook lists a bin entry only while its
+/// item (`item/<name>`) exists, so the item goes last: first every object
+/// outside the entries' items (the `item/` and `parent/` markers), then the
+/// items of the entries whose first wave fully succeeded. After a failure
+/// the entry stays in Trash with what is left, instead of leaving markers
+/// that no entry lists and no purge can reach.
+async fn delete_entries_singly(
+    remote: &Arc<S3Remote>,
+    objects: Vec<(String, String)>,
+    entries: &[EntryArea],
+) -> (Vec<String>, Result<(), IpcError>) {
+    let owner = |path: &str| {
+        entries
+            .iter()
+            .position(|entry| path.starts_with(&entry.storage_prefix))
+    };
+    let in_item = |path: &str| {
+        owner(path).is_some_and(|index| {
+            let root = &entries[index].root_path;
+            path == root
+                || path
+                    .strip_prefix(root.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let (items, outside): (Vec<_>, Vec<_>) =
+        objects.into_iter().partition(|(path, _)| in_item(path));
+    let first_wave = outside
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let (mut gone, mut result) = delete_singly(remote, outside).await;
+    let deleted = gone.iter().collect::<HashSet<_>>();
+    let unfinished = first_wave
+        .iter()
+        .filter(|path| !deleted.contains(path))
+        .filter_map(|path| owner(path))
+        .collect::<HashSet<_>>();
+    // Refused credentials would refuse the second wave as well.
+    let refused = result
+        .as_ref()
+        .is_err_and(|error| refusal_code(error.code()));
+    let items = items
+        .into_iter()
+        .filter(|(path, _)| {
+            !refused && owner(path).is_none_or(|index| !unfinished.contains(&index))
+        })
+        .collect::<Vec<_>>();
+    if !items.is_empty() {
+        let (deleted, outcome) = delete_singly(remote, items).await;
+        gone.extend(deleted);
+        if result.is_ok() {
+            result = outcome;
+        }
+    }
+    (gone, result)
+}
+
+/// Errors every further request with these credentials would get too.
+fn refusal_code(code: &str) -> bool {
+    matches!(
+        code,
+        "ACCESS_DENIED" | "SIGNATURE_MISMATCH" | "CLOCK_SKEW" | "NO_SUCH_BUCKET"
+    )
+}
+
+/// Deletes `(path, key)` objects one unconditional DeleteObject each,
+/// `PARALLEL` at a time. Once S3 refuses these credentials, the requests not
+/// yet sent are skipped. Returns the paths that are gone and the first error.
+async fn delete_singly(
+    remote: &Arc<S3Remote>,
+    objects: Vec<(String, String)>,
+) -> (Vec<String>, Result<(), IpcError>) {
+    let refused = Arc::new(AtomicBool::new(false));
+    let jobs = objects
+        .into_iter()
+        .map(|(path, key)| {
+            let remote = remote.clone();
+            let refused = refused.clone();
+            async move {
+                if refused.load(Ordering::Relaxed) {
+                    return (path, Err(None));
+                }
+                let result = match remote.delete(&key, None).await {
+                    // DeleteObject on a missing key: already gone.
+                    Err(error) if error.code() == "NOT_FOUND" => Ok(()),
+                    other => other,
+                };
+                if let Err(error) = &result
+                    && refusal_code(error.code())
+                {
+                    refused.store(true, Ordering::Relaxed);
+                }
+                (path, result.map_err(Some))
+            }
+        })
+        .collect();
+    let results = parallel(jobs).await;
+    // A skipped job has no error of its own: report the refusal that stopped it.
+    let first = results
+        .iter()
+        .find_map(|(_, result)| result.as_ref().err().copied().flatten());
+    let gone = results
+        .into_iter()
+        .filter_map(|(path, result)| result.is_ok().then_some(path))
+        .collect();
+    (gone, first.map_or(Ok(()), Err))
 }
 
 /// Moves objects server side: every copy first, then the sources go, each
@@ -3464,13 +3934,22 @@ fn plan_rename(session: &Session, id: &str, wanted: &str) -> Result<Relocation, 
     })
 }
 
+/// Document windows holding the item first write their pending edit to the
+/// outbox (it is uploaded before the move) and wait, read-only, until the
+/// change is done; afterwards they follow it.
 #[tauri::command]
 pub async fn node_rename(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
     id: String,
     name: String,
 ) -> Result<CreatedNode, IpcError> {
-    rename_node(&state, &id, &name).await
+    let holders = state.holders_within(&id);
+    crate::window::flush_document_windows(&app, holders.clone()).await;
+    let result = rename_node(&state, &id, &name).await;
+    crate::window::deliver_hold_notices(&app);
+    crate::window::resume_document_windows(&app, &holders);
+    result
 }
 
 async fn rename_node(state: &NotebookState, id: &str, name: &str) -> Result<CreatedNode, IpcError> {
@@ -3481,11 +3960,17 @@ async fn rename_node(state: &NotebookState, id: &str, name: &str) -> Result<Crea
 
 #[tauri::command]
 pub async fn node_move(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
     id: String,
     new_parent_id: String,
 ) -> Result<CreatedNode, IpcError> {
-    move_node(&state, &id, &new_parent_id).await
+    let holders = state.holders_within(&id);
+    crate::window::flush_document_windows(&app, holders.clone()).await;
+    let result = move_node(&state, &id, &new_parent_id).await;
+    crate::window::deliver_hold_notices(&app);
+    crate::window::resume_document_windows(&app, &holders);
+    result
 }
 
 async fn move_node(
@@ -3531,6 +4016,9 @@ async fn relocate(state: &NotebookState, plan: Relocation) -> Result<CreatedNode
             tree: TreeDelta::default(),
         });
     }
+    // Document windows inside wrote their pending edit already; until the
+    // objects are at their new keys they cannot stage another (`BUSY`).
+    let _frozen = state.freeze_holds_within(&source);
     commit_subtree(state, &source).await?;
     let live = unlocked(state)?;
     if kind == "Folder" {
@@ -3549,7 +4037,9 @@ async fn relocate(state: &NotebookState, plan: Relocation) -> Result<CreatedNode
         return Err(IpcError::invalid("The selected item does not exist."));
     }
     let (writes, moved) = move_objects(&live.remote, &moves).await;
-    let tree = finish_moves(state, &live, &moves, writes)?;
+    let tree = finish_moves(state, &live, &moves, writes);
+    state.follow_holds(&source, Some(&destination));
+    let tree = tree?;
     moved?;
     Ok(CreatedNode {
         id,
@@ -3558,12 +4048,20 @@ async fn relocate(state: &NotebookState, plan: Relocation) -> Result<CreatedNode
     })
 }
 
+/// A document window showing the item writes its pending edit first, and
+/// closes once the item is in the Trash.
 #[tauri::command]
 pub async fn node_trash(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
     id: String,
 ) -> Result<TrashResult, IpcError> {
-    trash_node(&state, &id).await
+    let holders = state.holders_within(&id);
+    crate::window::flush_document_windows(&app, holders.clone()).await;
+    let result = trash_node(&state, &id).await;
+    crate::window::deliver_hold_notices(&app);
+    crate::window::resume_document_windows(&app, &holders);
+    result
 }
 
 /// Notebook's delete: the item moves into its own container under
@@ -3576,6 +4074,7 @@ async fn trash_node(state: &NotebookState, id: &str) -> Result<TrashResult, IpcE
             .map(|node| (node.logical_path.clone(), node.kind))
     })?
     .ok_or_else(|| IpcError::invalid("The selected item does not exist."))?;
+    let _frozen = state.freeze_holds_within(&source);
     commit_subtree(state, &source).await?;
     let live = unlocked(state)?;
     if kind == "Folder" {
@@ -3604,7 +4103,9 @@ async fn trash_node(state: &NotebookState, id: &str) -> Result<TrashResult, IpcE
         }
         Err(error) => Err(error),
     };
-    let tree = finish_moves(state, &live, &moves, writes)?;
+    let tree = finish_moves(state, &live, &moves, writes);
+    state.follow_holds(&source, None);
+    let tree = tree?;
     moved?;
     Ok(TrashResult {
         entry_id: plan.key,
@@ -3678,7 +4179,8 @@ async fn restore_entry(
             Ok(etags) => {
                 writes.extend(copied(&moves, etags));
                 // Trash contents: the sources and the container's markers.
-                let (gone, deleted) = delete_in_batches(&live.remote, contents).await;
+                let (gone, deleted) =
+                    delete_in_batches(&live.remote, contents, &[EntryArea::of(&entry)]).await;
                 writes.extend(gone.into_iter().map(|path| (path, None)));
                 deleted
             }
@@ -3777,7 +4279,8 @@ async fn purge_entries(
     if entries.is_empty() && keys.is_some_and(|keys| !keys.is_empty()) {
         return Err(missing_entry());
     }
-    let (gone, deleted) = delete_in_batches(&live.remote, objects).await;
+    let areas = entries.iter().map(EntryArea::of).collect::<Vec<_>>();
+    let (gone, deleted) = delete_in_batches(&live.remote, objects, &areas).await;
     let tree = apply_writes(
         state,
         &live,
@@ -3795,39 +4298,22 @@ async fn purge_entries(
     })
 }
 
-#[tauri::command]
-pub fn search_titles(
-    state: State<'_, NotebookState>,
-    query: String,
-    include_trash: bool,
-) -> Result<Vec<String>, IpcError> {
-    let query = query.trim().to_lowercase();
-    let inner = state
-        .inner
-        .lock()
-        .map_err(|_| IpcError::internal("STATE"))?;
-    let session = inner.session.as_ref().ok_or_else(IpcError::locked)?;
-    let mut matches = session
-        .nodes
-        .values()
-        .filter(|node| node.name.to_lowercase().contains(&query))
-        .map(|node| node.id.clone())
-        .collect::<Vec<_>>();
-    if include_trash {
-        matches.extend(
-            trash_entries(&session.objects)
-                .into_iter()
-                .filter(|entry| entry.name.to_lowercase().contains(&query))
-                .map(|entry| format!("trash-{}", entry.key)),
-        );
-    }
-    matches.sort();
-    Ok(matches)
-}
-
+/// The page closes its document windows first; a new phrase is a new
+/// session, so any left are closed afterwards.
 #[tauri::command]
 pub async fn passphrase_change(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
+    old_passphrase: String,
+    new_passphrase: String,
+) -> Result<PassphraseChangeResult, IpcError> {
+    let result = change_passphrase(&state, old_passphrase, new_passphrase).await;
+    crate::window::close_stale_document_windows(&app);
+    result
+}
+
+async fn change_passphrase(
+    state: &NotebookState,
     old_passphrase: String,
     new_passphrase: String,
 ) -> Result<PassphraseChangeResult, IpcError> {
@@ -3863,7 +4349,7 @@ pub async fn passphrase_change(
         });
     }
     // Every key changes, so no edit may stay queued under an old one.
-    commit_all(&state).await.map_err(|error| {
+    commit_all(state).await.map_err(|error| {
         if is_offline_error(&error) {
             IpcError::new(
                 "UNSYNCED",
@@ -3873,8 +4359,8 @@ pub async fn passphrase_change(
             error
         }
     })?;
-    let _ = refresh(&state).await?;
-    let objects = with_session(&state, |session| session.objects.clone())?;
+    let _ = refresh(state).await?;
+    let objects = with_session(state, |session| session.objects.clone())?;
     // Copy and verify the complete new-key workspace before deleting a single
     // old-key object. This phase is safely resumable after interruption.
     let mut migrated = BTreeMap::new();
@@ -3919,8 +4405,8 @@ pub async fn passphrase_change(
     // A remembered phrase follows the change before any old object is deleted,
     // so the next launch opens the workspace with the phrase that matches it.
     // Only while the workspace is still at the location that was migrated.
-    if workspaces::phrase_is_remembered(&state, &workspace)? {
-        workspaces::remember_phrase(&state, &workspace, &config, Some(&new_phrase))?;
+    if workspaces::phrase_is_remembered(state, &workspace)? {
+        workspaces::remember_phrase(state, &workspace, &config, Some(&new_phrase))?;
     }
     // A durable opaque journal is committed before cleanup. The app can now
     // use the new phrase even if deletion is interrupted or S3 goes offline.
@@ -3931,11 +4417,11 @@ pub async fn passphrase_change(
             etag: object.etag.clone(),
         })
         .collect::<Vec<_>>();
-    persist_cleanup(&state, &config, &cleanup)?;
+    persist_cleanup(state, &config, &cleanup)?;
     // The new session is the migrated objects, as written: no listing.
     let new_session = Session::new(config.clone(), new_codec, remote.clone(), migrated);
     {
-        let mut journal = lock_journal(&state)?;
+        let mut journal = lock_journal(state)?;
         let mut inner = state
             .inner
             .lock()
@@ -3958,7 +4444,7 @@ pub async fn passphrase_change(
             inner.session = Some(new_session);
         }
     }
-    let cleanup_pending = replay_cleanup(&state, &config, &remote).await?;
+    let cleanup_pending = replay_cleanup(state, &config, &remote).await?;
     Ok(PassphraseChangeResult { cleanup_pending })
 }
 
@@ -4008,7 +4494,6 @@ pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
         workspaces::workspace_save,
         workspaces::workspace_delete,
         workspaces::workspace_select,
-        connection_test,
         vault_unlock,
         vault_lock,
         passphrase_change,
@@ -4022,7 +4507,6 @@ pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
         trash_restore,
         trash_purge,
         trash_empty,
-        search_titles,
         doc_open,
         doc_stage,
         doc_commit,
@@ -4031,12 +4515,18 @@ pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
         crate::preview::preview_render,
         crate::links::link_open,
         crate::window::close_after_flush,
-        crate::window::cancel_close
+        crate::window::cancel_close,
+        crate::window::open_document_window,
+        crate::window::document_window_info,
+        crate::window::document_link_open,
+        crate::window::document_window_flushed,
+        crate::window::document_windows_close,
+        crate::window::document_window_close
     ])
 }
 
 /// Drives the command implementations without a Tauri runtime or keychain.
-/// Used only by the MinIO compatibility test in `tests/notebook_bin_compat.rs`.
+/// Used only by the integration tests in `tests/` (MinIO compatibility and S3 budget).
 #[doc(hidden)]
 pub mod testing {
     use super::*;
@@ -4096,6 +4586,45 @@ pub mod testing {
             unlock(&self.0, Some(phrase.to_owned()), None)
                 .await
                 .map(drop)
+        }
+
+        /// "Open in new window": the document window `label` writes `path`.
+        pub fn hold_as(&self, label: &str, path: &str) -> Result<(), IpcError> {
+            self.0.hold_document(label, &self.id_of(path)?).map(drop)
+        }
+
+        /// `doc_open` from window `label`: text, dirty and read-only.
+        pub async fn open_as(
+            &self,
+            path: &str,
+            label: &str,
+        ) -> Result<(String, bool, bool), IpcError> {
+            open_document_as(&self.0, &self.id_of(path)?, label)
+                .await
+                .map(|document| {
+                    (
+                        document.text.unwrap_or_default(),
+                        document.dirty,
+                        document.read_only,
+                    )
+                })
+        }
+
+        /// `doc_stage` from window `label`.
+        pub fn stage_as(
+            &self,
+            path: &str,
+            text: &str,
+            label: &str,
+        ) -> Result<&'static str, IpcError> {
+            stage_document_as(&self.0, &self.id_of(path)?, text.to_owned(), label)
+        }
+
+        /// `doc_commit` from window `label`.
+        pub async fn commit_as(&self, path: &str, label: &str) -> Result<&'static str, IpcError> {
+            commit_document_as(&self.0, &self.id_of(path)?, label)
+                .await
+                .map(|result| result.status)
         }
 
         /// The Refresh button: S3 is listed again.
@@ -4183,7 +4712,7 @@ pub mod testing {
         pub async fn read(&self, path: &str) -> Result<String, IpcError> {
             open_document(&self.0, &self.id_of(path)?)
                 .await
-                .map(|document| document.text)
+                .map(|document| document.text.unwrap_or_default())
         }
 
         pub async fn trash(&self, path: &str) -> Result<String, IpcError> {
@@ -4246,7 +4775,7 @@ pub mod testing {
         pub async fn open(&self, path: &str) -> Result<(String, bool), IpcError> {
             open_document(&self.0, &self.id_of(path)?)
                 .await
-                .map(|document| (document.text, document.dirty))
+                .map(|document| (document.text.unwrap_or_default(), document.dirty))
         }
 
         /// `doc_stage`: "Clean" or "Staged", without any S3 request.
@@ -4411,12 +4940,12 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
 
-    fn codec() -> NotebookV1Codec {
+    pub(super) fn codec() -> NotebookV1Codec {
         NotebookV1Codec::new(SecretString::from("correct horse".to_owned())).unwrap()
     }
 
     /// A client for sessions built in memory; nothing listens on port 9.
-    fn remote() -> Arc<S3Remote> {
+    pub(super) fn remote() -> Arc<S3Remote> {
         let config = local_config("http://127.0.0.1:9".into());
         Arc::new(S3Remote::new(&config, &local_credentials()).unwrap())
     }
@@ -4481,6 +5010,144 @@ mod tests {
         ));
     }
 
+    /// The DeleteObjects request is AWS's documented `POST /?delete` with the
+    /// body's Content-MD5 and Content-Type signed. The signature is the one
+    /// AWS's own signer (aws-sigv4 1.4.2, the AWS SDK for Rust's) computes for
+    /// this request, URL and time.
+    #[test]
+    fn delete_objects_is_signed_as_aws_documents_it() {
+        let bucket = Bucket::new(
+            "https://s3.eu-central-1.amazonaws.com".parse().unwrap(),
+            UrlStyle::VirtualHost,
+            "notebook-test",
+            "eu-central-1",
+        )
+        .unwrap();
+        let credentials =
+            S3Credentials::new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY");
+        let objects = [ObjectIdentifier::new("vault/abc".into())];
+        let mut action = bucket.delete_objects(Some(&credentials), objects.iter());
+        action.set_quiet(true);
+        let (body, md5) = action.body_with_md5();
+        assert_eq!(
+            body,
+            "<Delete><Object><Key>vault/abc</Key></Object><Quiet>true</Quiet></Delete>"
+        );
+        assert_eq!(md5, "PiVosRXi+EGvJyzkQLnN1w==");
+        let time = jiff::Timestamp::from_second(1_791_201_600).unwrap();
+        let url = delete_objects_url(&bucket, &credentials, &md5, &time);
+        assert_eq!(
+            url.host_str(),
+            Some("notebook-test.s3.eu-central-1.amazonaws.com")
+        );
+        assert_eq!(url.path(), "/");
+        let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+        assert_eq!(query.get("delete").map(|v| v.as_ref()), Some(""));
+        assert_eq!(
+            query["X-Amz-SignedHeaders"],
+            "content-md5;content-type;host"
+        );
+        assert_eq!(query["X-Amz-Expires"], "300");
+        assert_eq!(
+            query["X-Amz-Signature"],
+            "95b14780789c0dc404793c9192d2c9169cdfde2269b9c7205b97c44112b70b4c"
+        );
+    }
+
+    fn reply(status: u16, body: &str) -> Reply {
+        Reply {
+            status: StatusCode::from_u16(status).unwrap(),
+            etag: None,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn delete_objects_replies_separate_refusals_from_results() {
+        let outcome = |status, body: &str| delete_batch_outcome(&reply(status, body));
+        let refused = |status, code: &str| {
+            BatchOutcome::Refused(StatusCode::from_u16(status).unwrap(), code.into())
+        };
+        assert_eq!(
+            outcome(200, "<DeleteResult></DeleteResult>").unwrap(),
+            BatchOutcome::Processed(Vec::new())
+        );
+        assert_eq!(
+            outcome(
+                200,
+                r#"<?xml version="1.0"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Deleted><Key>a</Key></Deleted><Error><Key>b&amp;c</Key><Code>AccessDenied</Code><Message>Access Denied</Message></Error></DeleteResult>"#
+            )
+            .unwrap(),
+            BatchOutcome::Processed(vec![("b&c".into(), "AccessDenied".into())])
+        );
+        // A refusal of the request itself, with or without a known code.
+        for (status, code) in [
+            (403, "AccessDenied"),
+            (403, "SignatureDoesNotMatch"),
+            (400, "InvalidRequest"),
+            (405, "MethodNotAllowed"),
+            (501, "NotImplemented"),
+        ] {
+            let body = format!("<Error><Code>{code}</Code><Message>Key vault/x</Message></Error>");
+            assert_eq!(outcome(status, &body).unwrap(), refused(status, code));
+        }
+        assert_eq!(outcome(403, "").unwrap(), refused(403, ""));
+        // A 200 that carries an error, or no result, deleted nothing reliable.
+        assert_eq!(
+            outcome(200, "<Error><Code>MalformedXML</Code></Error>").unwrap(),
+            refused(200, "MalformedXML")
+        );
+        assert_eq!(outcome(200, "").unwrap(), refused(200, ""));
+        // Errors one-by-one deletes would get as well stay errors.
+        let error = |status, code: &str| {
+            outcome(status, &format!("<Error><Code>{code}</Code></Error>"))
+                .unwrap_err()
+                .code()
+        };
+        assert_eq!(error(403, "InvalidAccessKeyId"), "ACCESS_DENIED");
+        assert_eq!(error(403, "RequestTimeTooSkewed"), "CLOCK_SKEW");
+        assert_eq!(error(404, "NoSuchBucket"), "NO_SUCH_BUCKET");
+        assert_eq!(error(503, "SlowDown"), "S3_UNAVAILABLE");
+    }
+
+    #[test]
+    fn s3_errors_map_by_code_and_never_carry_s3_text() {
+        let error =
+            |status, body: &str| s3_error(StatusCode::from_u16(status).unwrap(), body.as_bytes());
+        assert_eq!(
+            error(403, "<Error><Code>SignatureDoesNotMatch</Code></Error>").code(),
+            "SIGNATURE_MISMATCH"
+        );
+        assert_eq!(
+            error(403, "<Error><Code>AccessDenied</Code></Error>").code(),
+            "ACCESS_DENIED"
+        );
+        assert_eq!(
+            error(400, "<Error><Code>InvalidRequest</Code></Error>").code(),
+            "S3_REJECTED"
+        );
+        assert_eq!(
+            error(400, "<Error><Code>ExpiredToken</Code></Error>").code(),
+            "ACCESS_DENIED"
+        );
+        assert_eq!(
+            error(412, "<Error><Code>PreconditionFailed</Code></Error>").code(),
+            "CONFLICT"
+        );
+        assert_eq!(
+            error(404, "<Error><Code>NoSuchKey</Code></Error>").code(),
+            "NOT_FOUND"
+        );
+        // A code that is not a plain token is ignored: the status decides.
+        assert_eq!(s3_error_code("<Code>Signature DoesNotMatch</Code>"), "");
+        assert_eq!(s3_error_code("<Code>a/b</Code>"), "");
+        let shown = error(
+            403,
+            "<Error><Code>AccessDenied</Code><Message>vault/secret-key</Message></Error>",
+        );
+        assert!(!format!("{shown:?}").contains("vault/secret-key"));
+    }
+
     #[test]
     fn name_validation_protects_the_compatibility_namespace() {
         for invalid in [
@@ -4492,6 +5159,10 @@ mod tests {
             " _delete ",
             "a/b",
             "a\\b",
+            "a\nImported.md",
+            "tab\there.md",
+            "bell\u{7}.md",
+            "c1\u{85}.md",
         ] {
             assert!(validate_name(invalid).is_err());
         }
@@ -4544,6 +5215,90 @@ mod tests {
         assert_eq!(trash[1].trash_entry_id.as_deref(), Some("legacy:3f2a"));
     }
 
+    /// The frontend counts Trash entries from the deltas: Restore, Delete
+    /// permanently and Empty Trash must remove the entry's node, Move to
+    /// Trash must add one.
+    #[test]
+    fn trash_changes_add_and_remove_entries_in_the_delta() {
+        let codec = codec();
+        let bin = |id: &str, name: &str| {
+            vec![
+                format!("_deleted/items/{id}/item/.notebook_dir"),
+                format!("_deleted/items/{id}/item/{name}"),
+            ]
+        };
+        let listed = [
+            "notes/keep.md".to_owned(),
+            "_deleted/items/.notebook_dir".to_owned(),
+        ]
+        .into_iter()
+        .chain(bin("2-b-md", "b.md"))
+        .chain(bin("1-c-md", "c.md"))
+        .map(|path| ListedObject {
+            key: codec.encode_path(&path).unwrap(),
+            etag: "etag".into(),
+        })
+        .collect();
+        let mut session =
+            build_session(&VaultConfig::default(), codec.clone(), listed, remote()).unwrap();
+        let object = |path: &str| Object {
+            key: codec.encode_path(path).unwrap(),
+            etag: "etag".into(),
+        };
+        let count = |session: &Session| {
+            session
+                .view
+                .values()
+                .filter(|node| node.kind == "TrashEntry")
+                .count()
+        };
+        assert_eq!(count(&session), 2);
+        // Restore b.md: copied back, its bin objects deleted.
+        let version = session.version;
+        session.apply(
+            [("notes/b.md".to_owned(), Some(object("notes/b.md")))]
+                .into_iter()
+                .chain(bin("2-b-md", "b.md").into_iter().map(|path| (path, None))),
+        );
+        let restored = session.rebuild();
+        assert_eq!(restored.from, version);
+        assert_eq!(restored.remove, ["trash-bin:2-b-md"]);
+        assert_eq!(
+            restored
+                .upsert
+                .iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b.md"]
+        );
+        assert_eq!(count(&session), 1);
+        // Delete permanently (or Empty Trash) c.md.
+        session.apply(bin("1-c-md", "c.md").into_iter().map(|path| (path, None)));
+        let purged = session.rebuild();
+        assert_eq!(purged.from, restored.to);
+        assert_eq!(purged.remove, ["trash-bin:1-c-md"]);
+        assert!(purged.upsert.is_empty());
+        assert_eq!(count(&session), 0);
+        // Move to Trash: the entry appears, the document leaves the tree.
+        session.apply(
+            bin("3-keep-md", "keep.md")
+                .into_iter()
+                .map(|path| {
+                    let written = object(&path);
+                    (path, Some(written))
+                })
+                .chain([("notes/keep.md".to_owned(), None)]),
+        );
+        let trashed = session.rebuild();
+        assert!(trashed.upsert.iter().any(|node| node.kind == "TrashEntry"));
+        assert!(
+            trashed
+                .remove
+                .contains(&stable_id("document", "notes/keep.md"))
+        );
+        assert_eq!(count(&session), 1);
+    }
+
     #[test]
     fn restore_never_overwrites_and_recreates_a_missing_parent() {
         let codec = codec();
@@ -4566,7 +5321,7 @@ mod tests {
     }
 
     /// A state with a memory keychain: no test reaches the OS keychain.
-    fn temporary_state() -> (tempfile::TempDir, NotebookState) {
+    pub(super) fn temporary_state() -> (tempfile::TempDir, NotebookState) {
         let directory = tempfile::tempdir().unwrap();
         let state = NotebookState::load_with(
             directory.path().join("config"),

@@ -4,20 +4,23 @@
 // can run it.
 //
 // Save model: an edit is durable once Rust has written it to the encrypted
-// local outbox ("stage": 1 s after typing pauses, no network) and synced
+// local outbox ("stage": 1 s after typing pauses, no network; 5 s for a text
+// over 2 Mi characters, because each stage sends the whole text; at least
+// every 10 s while typing goes on without such a pause) and synced
 // once S3 holds it ("commit": Cmd/Ctrl+S, document switch, window blur,
 // close, lock, 30 s idle, or 120 s of continuous editing). Typing never waits
 // on S3, and close and lock wait for it at most 3 s.
 
-export type DocumentData = { text: string; readOnly: boolean; dirty?: boolean };
+/** `text` null: the editor's kept text is still the one of `rev` (Editor.revOf). */
+export type DocumentData = { text: string | null; readOnly: boolean; dirty?: boolean; rev?: string };
 /** The status-bar dot. "busy": an upload has been running for over 1 s. */
 export type SyncState = "clean" | "dirty" | "busy" | "offline" | "failed";
-export type CommitResult = {
+type CommitResult = {
   status: "Saved" | "Offline" | "ConflictCopy";
   document_id?: string | null;
 };
 
-export interface DocumentStore {
+interface DocumentStore {
   open(id: string): Promise<DocumentData>;
   /** Writes the edit to the encrypted local outbox. Never touches S3. */
   stage(id: string, text: string): Promise<"Clean" | "Staged">;
@@ -25,7 +28,7 @@ export interface DocumentStore {
   commit(id: string): Promise<CommitResult>;
 }
 
-export interface SessionEvents {
+interface SessionEvents {
   /** Called only when the visible state changes. */
   state(state: SyncState): void;
   /** Another device changed the document; the edit became a copy beside it. */
@@ -34,13 +37,23 @@ export interface SessionEvents {
 
 export const SAVE_TIMING = {
   stageMs: 1_000,
+  /**
+   * A text longer than `largeChars` (UTF-16 units) is staged after this
+   * pause instead: a stage of 12 MB is 13 MB of IPC and about 170 ms of
+   * work. Switch, Cmd/Ctrl+S, blur, close, lock and every upload still
+   * stage it at once.
+   */
+  largeStageMs: 5_000,
+  largeChars: 2 * 1024 * 1024,
+  /** Typing without such a pause is staged this long after its first unstaged edit. */
+  maxStageWaitMs: 10_000,
   idleMs: 30_000,
   maxDirtyMs: 120_000,
   busyMs: 1_000,
   exitBudgetMs: 3_000,
   retryMs: [15_000, 30_000, 60_000, 120_000, 300_000],
 };
-export type SaveTiming = typeof SAVE_TIMING;
+type SaveTiming = typeof SAVE_TIMING;
 
 type PendingText = string | (() => string);
 type Outcome = "saved" | "offline" | "failed";
@@ -64,11 +77,14 @@ export class DocumentSession {
   private sequence = 0;
   private edits = 0;
   private docs = new Map<string, Doc>();
-  private pending: { doc: Doc; text: PendingText; edit: number } | null = null;
+  /** The newest unstaged edit; `since`: when the first edit it stands for was typed. */
+  private pending: { doc: Doc; text: PendingText; edit: number; since: number } | null = null;
   /** A journal write that failed; retried before the next one. */
   private failedJob: Job | null = null;
   private staging: Promise<boolean> = Promise.resolve(true);
   private lastEditAt = 0;
+  /** The pause after which the pending edit is staged (stageMs or largeStageMs). */
+  private stageAfter = 0;
   private dirtySince: number | null = null;
   private retryAt: number | null = null;
   private retries = 0;
@@ -97,13 +113,18 @@ export class DocumentSession {
     this.now = now;
   }
 
-  /** Records an edit of the open document. Only a state change touches the UI. */
-  edited(text: PendingText): void {
+  /**
+   * Records an edit of the open document, whose text is `length` UTF-16
+   * units long (it picks the staging pause). Only a state change touches
+   * the UI.
+   */
+  edited(text: PendingText, length = 0): void {
     if (!this.openId) return;
     const doc = this.track(this.openId);
     doc.edit = ++this.edits;
-    this.pending = { doc, text, edit: doc.edit };
     this.lastEditAt = this.now();
+    this.pending = { doc, text, edit: doc.edit, since: this.pending?.doc === doc ? this.pending.since : this.lastEditAt };
+    this.stageAfter = length > this.timing.largeChars ? this.timing.largeStageMs : this.timing.stageMs;
     this.dirtySince ??= this.lastEditAt;
     this.render();
     this.schedule();
@@ -202,8 +223,9 @@ export class DocumentSession {
     if (this.pending) void this.persist();
     this.openId = id;
     const doc = this.track(id);
-    // An edit from the outbox that S3 does not hold yet.
-    if (data.dirty && !isDirty(doc)) doc.edit = doc.staged = ++this.edits;
+    // An edit from the outbox that S3 does not hold yet; one another window
+    // writes (read-only here) is that window's to upload.
+    if (data.dirty && !data.readOnly && !isDirty(doc)) doc.edit = doc.staged = ++this.edits;
     this.lastEditAt = this.now();
     this.dirtySince = isDirty(doc) ? this.lastEditAt : null;
     show(data);
@@ -252,6 +274,23 @@ export class DocumentSession {
       }
     }
     if (this.openId === from) this.openId = to;
+    this.settleProblems();
+    this.render();
+    this.schedule();
+  }
+
+  /**
+   * Another window writes `id` from now on (spec E): its edits written here
+   * are in the outbox and that window uploads them, so nothing of `id` is
+   * retried or uploaded from here. The editor may keep showing it.
+   */
+  handOff(id: string): void {
+    const doc = this.docs.get(id);
+    if (!doc) return;
+    this.docs.delete(id);
+    if (this.pending?.doc === doc) this.pending = null;
+    if (this.failedJob?.doc === doc) this.failedJob = null;
+    if (this.openId === id) this.dirtySince = null;
     this.settleProblems();
     this.render();
     this.schedule();
@@ -405,13 +444,18 @@ export class DocumentSession {
   private nextDue(): number | null {
     if (this.holds > 0) return null;
     let due = Infinity;
-    if (this.pending) due = this.lastEditAt + this.timing.stageMs;
+    if (this.pending) due = this.stageDue(this.pending.since);
     const open = this.openDoc();
     if (open && isDirty(open) && !open.uploading && !open.unsynced) {
       due = Math.min(due, this.lastEditAt + this.timing.idleMs, (this.dirtySince ?? this.lastEditAt) + this.timing.maxDirtyMs);
     }
     if (this.retryAt !== null) due = Math.min(due, this.retryAt);
     return due === Infinity ? null : due;
+  }
+
+  /** When the pending edit typed since `since` is staged: after its pause, or at the latest maxStageWaitMs on. */
+  private stageDue(since: number): number {
+    return Math.min(this.lastEditAt + this.stageAfter, since + this.timing.maxStageWaitMs);
   }
 
   /**
@@ -436,7 +480,7 @@ export class DocumentSession {
     this.timerAt = Infinity;
     if (this.holds > 0) return;
     const now = this.now();
-    if (this.pending && now >= this.lastEditAt + this.timing.stageMs) void this.persist();
+    if (this.pending && now >= this.stageDue(this.pending.since)) void this.persist();
     const open = this.openDoc();
     if (open && isDirty(open) && !open.uploading && !open.unsynced
       && (now >= this.lastEditAt + this.timing.idleMs || now >= (this.dirtySince ?? now) + this.timing.maxDirtyMs)) {

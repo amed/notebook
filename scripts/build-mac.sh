@@ -7,8 +7,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Homebrew's rustup is keg-only: its cargo/rustc wrappers are not on PATH by
-# default. Prefer those wrappers over a toolchain's bin folder, because they
-# also let rustc find libLLVM when it strips the release binary.
+# default. Prefer them over a toolchain's bin folder, which needs rustup's
+# environment. (Stripping no longer depends on it: the linker strips, see
+# src-tauri/build.rs.)
 for dir in /opt/homebrew/opt/rustup/bin /usr/local/opt/rustup/bin "$HOME/.cargo/bin"; do
   if [ -x "$dir/cargo" ]; then
     export PATH="$dir:$PATH"

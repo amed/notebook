@@ -10,7 +10,7 @@
    markup; nothing is copied from Obsidian's own stylesheet.
 
    Sections
-     1. Fonts (bundled, CSP font-src 'self')
+     1. Fonts (system stacks, none bundled)
      2. Foundation tokens (shared by both themes)
      3. Palettes: dark (default), light, and the OS fallback that applies
         before JavaScript sets <html data-theme>
@@ -18,47 +18,32 @@
      5. Reset and base
      6. Layout: shell, sidebar, content and its header, editor area, status bar
      7. Components: icons, buttons, inputs, file tree, view mode switch,
-        menus, modals, notices, auth screens, empty state
+        menus, modals, auth screens, empty state
      8. Reading view (preview) typography, inline title, HTML preview frame
-     9. Editor host (Monaco)
+     9. Editor host (CodeMirror)
     10. Scrollbars, focus, selection, reduced motion
     11. Responsive
 
-   Rule: colour literals appear only in sections 3 and 4. Monaco reads its
-   colours from these same custom properties at runtime (src/theme.ts and
-   src/editor/monaco.ts), so this file is the single source of truth.
+   Rule: colour literals appear only in sections 3 and 4. The editor is
+   styled with these same custom properties (section 9; src/editor/editor.ts
+   only names the classes), so this file is the single source of truth.
    ========================================================================== */
 
 /* 1. Fonts ----------------------------------------------------------------
-   Inter (SIL OFL 1.1, see assets/fonts/inter/OFL.txt). It is a variable font
-   with a weight axis from 100 to 900, in normal and italic, split by Unicode
-   range so only the scripts a document uses are loaded. */
-
-@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-cyrillic-ext-wght-normal.woff2") format("woff2"); unicode-range: U+0460-052F, U+1C80-1C8A, U+20B4, U+2DE0-2DFF, U+A640-A69F, U+FE2E-FE2F; }
-@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-cyrillic-wght-normal.woff2") format("woff2"); unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116; }
-@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-greek-ext-wght-normal.woff2") format("woff2"); unicode-range: U+1F00-1FFF; }
-@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-greek-wght-normal.woff2") format("woff2"); unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF; }
-@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-vietnamese-wght-normal.woff2") format("woff2"); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
-@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-latin-ext-wght-normal.woff2") format("woff2"); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
-@font-face { font-family: "Inter Variable"; font-style: normal; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-latin-wght-normal.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
-@font-face { font-family: "Inter Variable"; font-style: italic; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-cyrillic-ext-wght-italic.woff2") format("woff2"); unicode-range: U+0460-052F, U+1C80-1C8A, U+20B4, U+2DE0-2DFF, U+A640-A69F, U+FE2E-FE2F; }
-@font-face { font-family: "Inter Variable"; font-style: italic; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-cyrillic-wght-italic.woff2") format("woff2"); unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116; }
-@font-face { font-family: "Inter Variable"; font-style: italic; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-greek-ext-wght-italic.woff2") format("woff2"); unicode-range: U+1F00-1FFF; }
-@font-face { font-family: "Inter Variable"; font-style: italic; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-greek-wght-italic.woff2") format("woff2"); unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF; }
-@font-face { font-family: "Inter Variable"; font-style: italic; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-vietnamese-wght-italic.woff2") format("woff2"); unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB; }
-@font-face { font-family: "Inter Variable"; font-style: italic; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-latin-ext-wght-italic.woff2") format("woff2"); unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF; }
-@font-face { font-family: "Inter Variable"; font-style: italic; font-weight: 100 900; font-display: swap; src: url("./assets/fonts/inter/inter-latin-wght-italic.woff2") format("woff2"); unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD; }
+   None bundled. The system UI font comes first, as in Obsidian: SF Pro on
+   macOS, Segoe UI on Windows, then Roboto or an installed Inter, and on
+   Linux the desktop's own sans-serif (fontconfig: DejaVu Sans, Noto Sans,
+   Cantarell...). The 14 bundled Inter files (453 KB) were never loaded on
+   macOS or Windows. */
 
 /* 2. Foundation tokens ---------------------------------------------------- */
 
 :root {
   /* Typography: font families. Obsidian's order: the system UI font first
-     (SF Pro on macOS, Segoe UI on Windows), then Roboto, then Inter. The
-     bundled "Inter Variable" sits where Obsidian lists Inter, so Linux and
-     any system without those fonts still gets a packaged, consistent face.
-     Code uses Obsidian's system monospace stack (SF Mono on macOS). */
-  --font-bundled: "Inter Variable";
-  --font-default: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter Variable", "Inter", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
+     (SF Pro on macOS, Segoe UI on Windows), then Roboto, then Inter, then the
+     system's sans-serif (section 1). Code uses Obsidian's system monospace
+     stack (SF Mono on macOS). */
+  --font-default: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
   --font-monospace-default: ui-monospace, SFMono-Regular, "Cascadia Mono", "Roboto Mono", "DejaVu Sans Mono", "Liberation Mono", Menlo, Monaco, Consolas, "Source Code Pro", monospace;
   --font-interface: var(--font-default);
   --font-text: var(--font-default);
@@ -76,15 +61,10 @@
   --font-code-editor-size: 14px;
 
   /* Typography: weights and line heights */
-  --font-thin: 100;
-  --font-extralight: 200;
-  --font-light: 300;
   --font-normal: 400;
   --font-medium: 500;
   --font-semibold: 600;
   --font-bold: 700;
-  --font-extrabold: 800;
-  --font-black: 900;
   --bold-weight: var(--font-semibold);
   --line-height-normal: 1.5;
   --line-height-tight: 1.3;
@@ -100,7 +80,6 @@
   --size-4-5: 20px;
   --size-4-6: 24px;
   --size-4-8: 32px;
-  --size-4-9: 36px;
   --size-4-12: 48px;
   --size-4-16: 64px;
   --size-4-18: 72px;
@@ -116,13 +95,8 @@
   --icon-xs: 14px;
   --icon-s: 16px;
   --icon-m: 18px;
-  --icon-l: 18px;
-  --icon-xl: 32px;
   --icon-xs-stroke-width: 2px;
-  --icon-s-stroke-width: 2px;
   --icon-m-stroke-width: 1.75px;
-  --icon-l-stroke-width: 1.75px;
-  --icon-xl-stroke-width: 1.25px;
   --icon-size: var(--icon-m);
   --icon-stroke: var(--icon-m-stroke-width);
   --icon-opacity: 0.85;
@@ -136,9 +110,7 @@
   --layer-drag-overlay: 20;
   --layer-popover: 30;
   --layer-modal: 50;
-  --layer-notice: 60;
   --layer-menu: 65;
-  --layer-tooltip: 70;
 
   /* Accent: the app icon's orange by default; Settings > Appearance picks
      another from the palette below (html[data-accent]). Per accent:
@@ -157,7 +129,6 @@
   /* Motion */
   --anim-duration-fast: 100ms;
   --anim-duration-moderate: 180ms;
-  --anim-motion-smooth: cubic-bezier(0.45, 0.05, 0.55, 0.95);
 
   /* Workspace metrics */
   --header-height: 40px;
@@ -231,10 +202,6 @@
   --h2-letter-spacing: -0.011em;
   --h3-letter-spacing: -0.008em;
   --h4-letter-spacing: normal;
-  --inline-title-size: var(--h1-size);
-  --inline-title-weight: var(--h1-weight);
-  --inline-title-line-height: var(--h1-line-height);
-  --inline-title-margin-bottom: 0.5em;
   --code-size: var(--font-smaller);
   --code-radius: var(--radius-s);
   --blockquote-border-thickness: 2px;
@@ -283,7 +250,7 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
 
 /* 3. Palettes --------------------------------------------------------------
    Dark is the default. <html data-theme="dark|light"> is set by setTheme()
-   in src/editor/monaco.ts. Before that runs, the OS preference decides (see
+   in src/theme.ts. Before that runs, the OS preference decides (see
    the media query below the light block).
 
    The base scales, accent and extended colours are the values Obsidian
@@ -302,7 +269,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   color-scheme: dark;
 
   --color-base-00: #1e1e1e;
-  --color-base-05: #212121;
   --color-base-10: #242424;
   --color-base-20: #262626;
   --color-base-25: #2a2a2a;
@@ -314,7 +280,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --color-base-70: #b3b3b3;
   --color-base-100: #dadada;
 
-  --mono-rgb-0: 0, 0, 0;
   --mono-rgb-100: 255, 255, 255;
 
   --color-red-rgb: 251, 70, 76;
@@ -322,7 +287,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --color-yellow-rgb: 224, 222, 113;
   --color-green-rgb: 68, 207, 110;
   --color-cyan-rgb: 83, 223, 221;
-  --color-blue-rgb: 2, 122, 255;
   --color-purple-rgb: 168, 130, 255;
   --color-pink-rgb: 250, 153, 205;
 
@@ -333,7 +297,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --text-accent: var(--color-accent-1);
   --text-accent-hover: var(--color-accent-2);
 
-  --background-secondary-alt: var(--color-base-30);
   --background-modifier-form-field: var(--color-base-25);
   --background-modifier-cover: rgba(10, 10, 10, 0.4);
   --interactive-normal: var(--color-base-30);
@@ -341,7 +304,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --text-on-accent: var(--accent-on);
   --text-selection: hsla(var(--color-accent-hsl), 0.33);
   --text-selection-inactive: hsla(var(--color-accent-hsl), 0.18);
-  --notice-background: var(--color-base-30);
 
   /* Code colours: Obsidian's code palette */
   --code-function: var(--color-yellow);
@@ -366,7 +328,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   color-scheme: light;
 
   --color-base-00: #ffffff;
-  --color-base-05: #fcfcfc;
   --color-base-10: #fafafa;
   --color-base-20: #f6f6f6;
   --color-base-25: #e3e3e3;
@@ -378,7 +339,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --color-base-70: #5c5c5c;
   --color-base-100: #222222;
 
-  --mono-rgb-0: 255, 255, 255;
   --mono-rgb-100: 0, 0, 0;
 
   --color-red-rgb: 233, 49, 71;
@@ -386,7 +346,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --color-yellow-rgb: 224, 172, 0;
   --color-green-rgb: 8, 185, 78;
   --color-cyan-rgb: 0, 191, 188;
-  --color-blue-rgb: 8, 109, 221;
   --color-purple-rgb: 120, 82, 238;
   --color-pink-rgb: 213, 57, 132;
 
@@ -397,7 +356,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --text-accent: hsl(var(--accent-h), var(--accent-s), var(--accent-text-l));
   --text-accent-hover: hsl(var(--accent-h), var(--accent-s), calc(var(--accent-text-l) * 0.88));
 
-  --background-secondary-alt: var(--color-base-05);
   --background-modifier-form-field: var(--color-base-00);
   --background-modifier-cover: rgba(220, 220, 220, 0.4);
   --interactive-normal: var(--color-base-00);
@@ -405,7 +363,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --text-on-accent: var(--accent-on);
   --text-selection: hsla(var(--color-accent-hsl), 0.2);
   --text-selection-inactive: hsla(var(--color-accent-hsl), 0.12);
-  --notice-background: var(--color-base-00);
 
   /* Code colours: Obsidian's hues, darkened to at least 4.5:1 on white */
   --code-function: #8f6c00;
@@ -436,7 +393,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
     color-scheme: light;
 
     --color-base-00: #ffffff;
-    --color-base-05: #fcfcfc;
     --color-base-10: #fafafa;
     --color-base-20: #f6f6f6;
     --color-base-25: #e3e3e3;
@@ -448,7 +404,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
     --color-base-70: #5c5c5c;
     --color-base-100: #222222;
 
-    --mono-rgb-0: 255, 255, 255;
     --mono-rgb-100: 0, 0, 0;
 
     --color-red-rgb: 233, 49, 71;
@@ -456,7 +411,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
     --color-yellow-rgb: 224, 172, 0;
     --color-green-rgb: 8, 185, 78;
     --color-cyan-rgb: 0, 191, 188;
-    --color-blue-rgb: 8, 109, 221;
     --color-purple-rgb: 120, 82, 238;
     --color-pink-rgb: 213, 57, 132;
 
@@ -467,7 +421,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
     --text-accent: hsl(var(--accent-h), var(--accent-s), var(--accent-text-l));
     --text-accent-hover: hsl(var(--accent-h), var(--accent-s), calc(var(--accent-text-l) * 0.88));
 
-    --background-secondary-alt: var(--color-base-05);
     --background-modifier-form-field: var(--color-base-00);
     --background-modifier-cover: rgba(220, 220, 220, 0.4);
     --interactive-normal: var(--color-base-00);
@@ -475,7 +428,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
     --text-on-accent: var(--accent-on);
     --text-selection: hsla(var(--color-accent-hsl), 0.2);
     --text-selection-inactive: hsla(var(--color-accent-hsl), 0.12);
-    --notice-background: var(--color-base-00);
 
     /* Code colours: Obsidian's hues, darkened to at least 4.5:1 on white */
     --code-function: #8f6c00;
@@ -513,7 +465,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --color-yellow: rgb(var(--color-yellow-rgb));
   --color-green: rgb(var(--color-green-rgb));
   --color-cyan: rgb(var(--color-cyan-rgb));
-  --color-blue: rgb(var(--color-blue-rgb));
   --color-purple: rgb(var(--color-purple-rgb));
   --color-pink: rgb(var(--color-pink-rgb));
   --color-accent-hsl: var(--accent-h), var(--accent-s), var(--accent-l);
@@ -531,7 +482,6 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --background-modifier-error: var(--color-red);
   --background-modifier-error-hover: rgba(var(--color-red-rgb), 0.85);
   --background-modifier-error-soft: rgba(var(--color-red-rgb), 0.1);
-  --background-modifier-success: var(--color-green);
 
   /* Interactive */
   --interactive-accent: var(--color-accent);
@@ -584,14 +534,12 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --focus-ring: 0 0 0 2px var(--focus-ring-color);
   --input-focus-ring: 0 0 0 2px var(--color-base-60);
 
-  /* Menus, modals, notices */
+  /* Menus and modals */
   --menu-background: var(--background-secondary);
   --menu-border-color: var(--background-modifier-border-hover);
   --menu-shadow: var(--shadow-s);
   --modal-background: var(--background-primary);
   --modal-border-color: var(--color-base-40);
-  --notice-text: var(--text-normal);
-  --notice-border: var(--background-modifier-border-hover);
 
   /* Status dots */
   --status-error: var(--color-red);
@@ -631,14 +579,12 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
   --h4-color: inherit;
   --h5-color: inherit;
   --h6-color: inherit;
-  --inline-title-color: var(--h1-color);
   --bold-color: inherit;
   --italic-color: inherit;
   --link-color: var(--text-accent);
   --link-color-hover: var(--text-accent-hover);
   --list-marker-color: var(--text-faint);
   --checkbox-color: var(--interactive-accent);
-  --checkbox-color-hover: var(--interactive-accent-hover);
   --checkbox-border-color: var(--text-faint);
   --checkbox-border-color-hover: var(--text-muted);
   --checkbox-marker-color: var(--background-primary);
@@ -655,14 +601,14 @@ fieldset.field > legend { padding: 0; margin-bottom: var(--size-4-2); }
      their own styles on a white page, whatever the app theme. */
   --html-preview-canvas: #ffffff;
 
-  /* Code (reading view and Monaco). The coloured --code-* tokens are set
+  /* Code (reading view and editor). The coloured --code-* tokens are set
      per theme in section 3. */
   --code-background: var(--background-primary-alt);
   --code-normal: var(--text-normal);
   --code-comment: var(--text-faint);
   --code-punctuation: var(--text-muted);
 
-  /* Monaco source mode. src/editor/monaco.ts reads these when it builds the editor theme. */
+  /* Editor source mode (section 9). */
   --editor-background: var(--background-primary);
   --editor-text: var(--text-normal);
   --editor-caret: var(--caret-color);
@@ -727,7 +673,7 @@ img, svg { flex: none; }
 
 /* 6. Layout ------------------------------------------------------------------
    Scrolling works only if every level from .shell to the scroll containers
-   (.tree, .preview, Monaco) has a bounded height. Every grid track below is
+   (.tree, .preview, the editor) has a bounded height. Every grid track below is
    minmax(0, 1fr), the sidebar is a flex column whose tree is the only
    flexible child, and every item sets min-height: 0, so a long document
    scrolls inside its pane instead of stretching the window. */
@@ -748,7 +694,7 @@ img, svg { flex: none; }
    .editor-area, .outline-panel and the handles); --split-ratio is the
    editor's share of the editor and preview in Split. They are registered as
    NOT inherited, so a drag restyles those few elements, never the file tree,
-   the outline's rows, Monaco or the preview. As ordinary (inherited) custom
+   the outline's rows, the editor or the preview. As ordinary (inherited) custom
    properties every frame of a drag restyled the whole window: about 50 ms a
    frame in WebKit with the 2,900-heading outline of a 12 MB document.
    (`inherit` is not an option: WebKit did not restyle a child that inherits
@@ -895,6 +841,8 @@ img, svg { flex: none; }
   align-items: center;
   gap: var(--size-4-3);
   min-width: 0;
+  /* The "Editing in another window" chip shrinks to its icon when narrow. */
+  container-type: inline-size;
   padding: 0 var(--size-4-2) 0 var(--size-4-4);
   border-bottom: var(--divider-width) solid var(--divider-color);
   background: var(--view-header-background);
@@ -951,6 +899,37 @@ img, svg { flex: none; }
   background: var(--divider-color);
 }
 
+/* "Editing in another window": a document window writes the open document,
+   so it is read-only here; a click brings that window to the front. */
+.elsewhere-note {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  height: 20px;
+  padding: 0 var(--size-4-2);
+  border: 0;
+  border-radius: var(--radius-xl);
+  background: var(--chip-accent-background);
+  color: var(--chip-accent-color);
+  font: inherit;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-medium);
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  gap: var(--size-2-2);
+  --icon-size: var(--icon-xs);
+  --icon-stroke: var(--icon-xs-stroke-width);
+}
+.elsewhere-note[hidden] { display: none; }
+.elsewhere-note:hover { box-shadow: inset 0 0 0 var(--border-width) currentColor; }
+/* Narrow header: only the icon, so the file name stays readable (the
+   button's aria-label and tooltip still say it). */
+@container (max-width: 720px) {
+  .elsewhere-note { padding-inline: var(--size-2-3); }
+  .elsewhere-note .elsewhere-label { display: none; }
+}
+
 /* Editor area: edit, split or preview. Each pane fills one bounded cell.
    In Split the editor's column is --split-ratio of what the outline leaves;
    the split handle sits on the same edge. (No helper custom properties here:
@@ -975,9 +954,29 @@ img, svg { flex: none; }
 .editor-area.preview-only .preview { display: block; }
 .editor-area.split .preview { border-left: var(--divider-width) solid var(--divider-color); }
 
+/* Focus mode (F9): the document alone. One class on .shell hides the
+   sidebar, the header, the status bar, the outline and every resize handle;
+   the panes keep their DOM, so nothing re-renders, and the editor and the
+   preview stay centred at --file-line-width. main.ts shows only Preview or
+   Edit here (never Split). An open outline keeps its box (same width, out
+   of the grid) and its layout, hidden: shown again from display: none, the
+   54,000 headings of a 12 MB document took one 840 ms task. A document
+   window (Open in new window) is always in focus mode. */
+.shell.focus-mode .workspace { grid-template-columns: minmax(0, 1fr); }
+.shell.focus-mode .content { grid-template-rows: minmax(0, 1fr); }
+.shell.focus-mode .editor-area { grid-template-columns: minmax(0, 1fr); }
+.shell.focus-mode :is(.sidebar, .sidebar-resizer, .document-bar, .statusbar, .outline-resizer, .split-resizer) { display: none; }
+.shell.focus-mode .editor-area .outline-panel {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--outline-width);
+  visibility: hidden;
+  content-visibility: hidden;
+}
+
 /* Resize handles (src/panel-resizer.ts): an invisible hit area that starts
    at the divider between two panes and reaches into the pane on its right,
-   which starts with padding (Monaco's left gutter, the preview's margin),
+   which starts with a margin (the editor's and the preview's),
    so it never covers the scrollbar on the divider's left. The accent line
    lies on the divider and shows on hover (after a short delay), keyboard
    focus and while dragging. The split handle is shown in Split only, the
@@ -1127,6 +1126,8 @@ img, svg { flex: none; }
   white-space: nowrap;
 }
 .outline-heading:hover { color: var(--text-normal); }
+/* The end of the drawn rows: nearing it draws the next ones. */
+.outline-more { height: 1px; }
 .outline-empty {
   margin: var(--size-4-3);
   color: var(--text-faint);
@@ -1589,9 +1590,17 @@ img, svg { flex: none; }
 .menu-item-text > span,
 .menu-item-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .menu-item-detail { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+/* A shortcut hint at the item's end ("Open in new window  ⌘⇧O") */
+.menu-shortcut {
+  margin-inline-start: auto;
+  padding-inline-start: var(--size-4-4);
+  color: var(--text-faint);
+  font: inherit;
+  font-size: var(--font-ui-smaller);
+}
 .context-menu.workspace-menu { width: calc(var(--sidebar-width) - var(--size-4-4)); max-width: calc(100vw - var(--size-4-4)); }
 
-/* Modals (main.ts uses .modal with a header; ui/primitives.ts uses .modal-card) */
+/* Modals (.modal with a header, built in main.ts) */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -1601,8 +1610,7 @@ img, svg { flex: none; }
   overflow: auto;
   background: var(--background-modifier-cover);
 }
-.modal,
-.modal-card {
+.modal {
   position: relative;
   width: min(var(--modal-width), 100%);
   max-height: min(85vh, calc(100vh - 48px));
@@ -1622,8 +1630,7 @@ img, svg { flex: none; }
   gap: var(--size-4-3);
   padding: var(--size-4-5) var(--size-4-4) 0 var(--size-4-5);
 }
-.modal h2,
-.modal-card > h2 {
+.modal h2 {
   margin: 0;
   color: var(--text-normal);
   font-size: var(--font-ui-large);
@@ -1633,9 +1640,14 @@ img, svg { flex: none; }
 }
 .modal header p {
   margin: var(--size-2-3) 0 0;
+  max-height: 50vh;
+  overflow: auto;
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   line-height: var(--line-height-normal);
+  /* Import summaries list one item per line; long paths wrap. */
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 .modal-close {
   width: 26px;
@@ -1647,8 +1659,6 @@ img, svg { flex: none; }
 .modal-body { padding: var(--size-4-4) var(--size-4-5) var(--size-4-5); }
 .modal-body:empty { display: none; }
 .modal > header:has(+ .modal-body:empty) { padding-bottom: var(--size-4-5); }
-.modal-card { padding: var(--size-4-5); }
-.modal-card > h2 { margin-bottom: var(--size-4-3); }
 .modal-message {
   margin: 0 0 var(--size-4-4);
   color: var(--text-muted);
@@ -1682,21 +1692,6 @@ img, svg { flex: none; }
   user-select: text;
   -webkit-user-select: text;
 }
-.modal-choices { display: grid; gap: var(--size-4-2); margin-bottom: var(--size-4-3); }
-.modal-choice {
-  flex-direction: column;
-  align-items: flex-start;
-  justify-content: center;
-  gap: var(--size-2-1);
-  height: auto;
-  min-height: var(--input-height);
-  padding: var(--size-4-2) var(--size-4-3);
-  line-height: var(--line-height-tight);
-  text-align: left;
-  white-space: normal;
-}
-.modal-choice small { color: var(--text-muted); font-size: var(--font-ui-smaller); font-weight: var(--font-normal); }
-.modal-choice.button-danger small { color: inherit; opacity: 0.85; }
 .modal-empty { margin-top: var(--size-4-4); }
 .modal-actions-spacer { flex: 1 1 auto; }
 
@@ -1854,44 +1849,6 @@ img, svg { flex: none; }
 }
 .trash-row span { margin-top: var(--size-2-1); color: var(--text-muted); font-size: var(--font-ui-smaller); }
 
-/* Notices (toasts) */
-.toast-region {
-  position: fixed;
-  top: calc(var(--header-height) + var(--size-4-2));
-  right: var(--size-4-4);
-  z-index: var(--layer-notice);
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: var(--size-4-2);
-  max-width: calc(100vw - var(--size-4-8));
-  pointer-events: none;
-}
-.toast {
-  display: flex;
-  align-items: center;
-  gap: var(--size-4-2);
-  max-width: 340px;
-  padding: var(--size-4-2) var(--size-4-3);
-  border: var(--border-width) solid var(--notice-border);
-  border-radius: var(--radius-m);
-  background: var(--notice-background);
-  box-shadow: var(--shadow-s);
-  color: var(--notice-text);
-  font-size: var(--font-ui-small);
-  line-height: var(--line-height-tight);
-  opacity: 0;
-  pointer-events: auto;
-  transform: translateY(-4px);
-  transition: opacity var(--anim-duration-moderate) ease, transform var(--anim-duration-moderate) ease;
-  --icon-size: var(--icon-s);
-  --icon-stroke: var(--icon-s-stroke-width);
-}
-.toast-visible { opacity: 1; transform: none; }
-.toast-default .icon { color: var(--icon-color); }
-.toast-success .icon { color: var(--text-success); }
-.toast-warning .icon { color: var(--text-warning); }
-
 /* Auth screens: setup, unlock and the startup error from boot.ts */
 .auth-screen {
   display: flex;
@@ -1984,40 +1941,36 @@ img, svg { flex: none; }
 
 /* Empty state */
 .empty { display: grid; place-items: center; height: 100%; color: var(--text-muted); }
-.empty-card { max-width: 320px; text-align: center; }
-.empty-card .large-icon {
-  display: grid;
-  place-items: center;
-  width: 52px;
-  height: 52px;
-  margin: 0 auto var(--size-4-4);
-  border: var(--border-width) solid var(--background-modifier-border);
-  border-radius: var(--radius-l);
-  background: var(--background-secondary);
-  color: var(--text-accent);
-  --icon-size: 24px;
-}
-.empty-card h2 { margin: 0 0 var(--size-4-2); color: var(--text-normal); font-size: var(--font-ui-medium); font-weight: var(--font-semibold); }
-.empty-card p { font-size: var(--font-ui-small); line-height: var(--line-height-normal); }
 
 /* 8. Reading view (preview) -------------------------------------------------
    The preview fills its grid cell and scrolls itself. The text column is
    centred at the readable line width with padding, so the scrollbar stays at
-   the pane edge and the mouse wheel works anywhere in the pane. */
+   the pane edge and the mouse wheel works anywhere in the pane.
+   contain: paint gives the pane its own composited scrolling layer: without
+   it, in Split, WebKit repainted the preview and the editor together on
+   every scroll step (1 MB rendered: preview scroll 18 -> 60 fps, editor
+   scroll 35 -> 60 fps, Split <-> Preview 270-330 -> 85-110 ms). */
 
+/* Content zoom (main.ts applyZoom): --content-zoom on .preview (and on
+   .editor-host, section 9), a number (1 when unset), scales the text, its
+   spacing and the readable width, so the column keeps its line length;
+   HTML pages zoom in their frame. */
 .preview {
+  --p-spacing: calc(1rem * var(--content-zoom, 1));
+  --heading-spacing: calc(var(--p-spacing) * 2.5);
   display: none;
   min-width: 0;
   min-height: 0;
   height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
+  contain: paint;
   padding-block: var(--file-margins) calc(var(--size-4-18) * 2);
-  padding-inline: max(var(--file-margins), calc((100% - var(--file-line-width)) / 2));
+  padding-inline: max(var(--file-margins), calc((100% - var(--file-line-width) * var(--content-zoom, 1)) / 2));
   background: var(--background-primary);
   color: var(--text-normal);
   font-family: var(--font-text);
-  font-size: var(--font-text-size);
+  font-size: calc(var(--font-text-size) * var(--content-zoom, 1));
   line-height: var(--line-height-normal);
   overflow-wrap: break-word;
   tab-size: 4;
@@ -2028,22 +1981,11 @@ img, svg { flex: none; }
 .preview > :first-child { margin-top: 0; }
 .preview > :last-child { margin-bottom: 0; }
 
-/* Inline title (pending markup): the note name above the reading view, as in Obsidian */
-.preview > .inline-title {
-  margin: 0 0 var(--inline-title-margin-bottom);
-  color: var(--inline-title-color);
-  font-size: var(--inline-title-size);
-  font-weight: var(--inline-title-weight);
-  line-height: var(--inline-title-line-height);
-  letter-spacing: var(--h1-letter-spacing);
-  overflow-wrap: anywhere;
-}
-
 /* HTML preview. For .html files html-preview.ts keeps one sandboxed
-   <iframe class="html-preview"> in .preview (with .html-mode) and a one-line
-   note above it when page scripts were not run. The frame scrolls itself and
-   fills the rest of the pane; the page is shown with its own styles in light
-   mode, as a browser would show it. */
+   <iframe class="html-preview"> in .preview (with .html-mode); scripts not
+   run are counted in the status bar (.scripts-off), not in the pane. The
+   frame scrolls itself and fills the rest of the pane; the page is shown
+   with its own styles in light mode, as a browser would show it. */
 .preview.html-mode { padding: 0; overflow: hidden; }
 .editor-area:is(.split, .preview-only) .preview.html-mode { display: flex; flex-direction: column; }
 .preview > .html-preview {
@@ -2056,33 +1998,22 @@ img, svg { flex: none; }
   color-scheme: light;
   background: var(--html-preview-canvas);
 }
-.preview > .html-preview-note {
-  flex: none;
-  margin: 0;
-  padding: var(--size-4-1) var(--size-4-3);
-  border-bottom: var(--border-width) solid var(--background-modifier-border);
-  background: var(--background-secondary);
-  color: var(--text-muted);
-  font-family: var(--font-interface);
-  font-size: var(--font-ui-smaller);
-  line-height: var(--line-height-tight);
-}
-.preview > .html-preview-note[hidden] { display: none; }
 .preview > .plain-preview {
   margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-family: var(--font-monospace);
-  font-size: var(--font-code-editor-size);
+  font-size: calc(var(--font-code-editor-size) * var(--content-zoom, 1));
 }
 .preview.html-mode > .preview-error { margin: var(--file-margins); }
 
-/* Documents over 512 KB: the preview renders only when Render is clicked. */
+/* Split, documents over 512 KB: the preview renders only when Render is
+   clicked; the note goes once the text is rendered. */
 .preview > .preview-paused {
   display: flex;
   align-items: center;
   gap: var(--size-4-3);
-  margin: 0 0 var(--p-spacing);
+  margin: 0 0 1rem;
   padding: var(--size-4-2) var(--size-4-3);
   border: var(--border-width) solid var(--background-modifier-border);
   border-radius: var(--radius-m);
@@ -2093,6 +2024,41 @@ img, svg { flex: none; }
 }
 .preview > .preview-paused > span { flex: 1; }
 .preview.html-mode > .preview-paused { flex: none; margin: 0; border-width: 0 0 var(--border-width); border-radius: 0; }
+
+/* The zoom level ("110%", main.ts showZoomLevel) for a second after a zoom
+   key, centred near the top of the content: over the last column (the
+   preview, or the editor in Edit) or, in Split, over both panes. It never
+   takes the pointer and fades out (at once with reduced motion). */
+.zoom-indicator {
+  position: absolute;
+  grid-row: 1 / -1;
+  grid-column: -2 / -1;
+  top: var(--size-4-4);
+  left: 50%;
+  z-index: var(--layer-cover);
+  translate: -50% 0;
+  padding: var(--size-4-1) var(--size-4-3);
+  border: var(--border-width) solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-primary);
+  box-shadow: var(--shadow-s);
+  color: var(--text-muted);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-small);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--line-height-tight);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--anim-duration-moderate) ease;
+}
+.editor-area.split > .zoom-indicator { grid-column: -3 / -1; }
+.zoom-indicator.shown { opacity: 1; transition-duration: 0s; }
+/* "Zoom" is for screen readers only. */
+.zoom-indicator-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+/* "Scripts off (N)": the HTML page in the preview had scripts that did not run. */
+.scripts-off { color: var(--text-faint); pointer-events: auto; cursor: default; }
 
 .preview p { margin-block: var(--p-spacing); }
 
@@ -2284,15 +2250,20 @@ img, svg { flex: none; }
   font-size: var(--font-ui-small);
 }
 
-/* 9. Editor host (Monaco) ------------------------------------------------------
-   Monaco's automaticLayout measures this element, so it must have a definite
-   height (the grid cell). monaco.ts centres the text at --file-line-width
-   with a left gutter and a bounded wrap column, so the scrollbar stays at
-   the pane edge. */
+/* 9. Editor host (CodeMirror) -------------------------------------------------
+   src/editor/editor.ts builds the editor; every colour, font and size of it
+   is set here, from the tokens. CodeMirror loads only its layout styles,
+   scoped by one generated class (.ͼ1 .cm-…), so the rules below carry one
+   class more (.editor-host .cm-editor …). The text column is
+   --file-line-width wide, centred, with at least --file-margins on both
+   sides: margins of .cm-content, so CodeMirror's wrapping measures the real
+   column, and the scrollbar stays at the pane edge. A click in a margin
+   puts the caret on that line (editor.ts). The zoom keys scale the text and
+   the column with --content-zoom, as in the preview (section 8). */
 
 .editor-host {
   position: relative;
-  /* Monaco's own z-indexes (its scrollbars are 11) stay inside the editor,
+  /* The editor's layers (selection, caret, find panel) stay inside it,
      under the narrow-window outline drawer. */
   isolation: isolate;
   min-width: 0;
@@ -2301,14 +2272,157 @@ img, svg { flex: none; }
   overflow: hidden;
   background: var(--editor-background);
 }
-.editor-host .monaco-editor,
-.editor-host .monaco-editor .overflow-guard { border-radius: 0; }
-.editor-host .monaco-editor .view-overlays .current-line { border: 0; }
-.editor-host .monaco-scrollable-element > .scrollbar > .slider {
-  border: 3px solid transparent;
-  border-radius: var(--radius-l);
-  background-clip: padding-box;
+.editor-host .cm-editor {
+  height: 100%;
+  background: var(--editor-background);
+  color: var(--editor-text);
+  font-family: var(--font-text);
+  font-size: calc(var(--font-text-size) * var(--content-zoom, 1));
 }
+.editor-host .cm-editor.cm-focused { outline: none; }
+/* Markdown and plain text are shown in the text font; HTML in the monospace code font. */
+.editor-host .cm-editor.cm-lang-html { font-family: var(--font-monospace); font-size: calc(var(--font-code-editor-size) * var(--content-zoom, 1)); }
+.editor-host .cm-editor .cm-scroller { font-family: inherit; line-height: var(--line-height-normal); }
+.editor-host .cm-editor .cm-content {
+  margin-right: var(--file-margins);
+  margin-left: max(var(--file-margins), calc((100% - var(--file-line-width) * var(--content-zoom, 1)) / 2));
+  padding: var(--file-margins) 0 var(--size-4-16);
+  caret-color: var(--editor-caret);
+}
+/* Soft wrap (Alt+Z) wraps at the readable width; without it long lines scroll sideways from the same left edge. */
+.editor-host .cm-editor .cm-content.cm-lineWrapping { max-width: calc(var(--file-line-width) * var(--content-zoom, 1)); }
+.editor-host .cm-editor .cm-line { padding: 0; }
+.editor-host .cm-editor .cm-cursor,
+.editor-host .cm-editor .cm-dropCursor { margin-left: -1px; border-left: 2px solid var(--editor-caret); }
+.editor-host .cm-editor .cm-selectionBackground { background: var(--editor-selection-inactive); }
+.editor-host .cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground { background: var(--editor-selection); }
+.editor-host .cm-editor .cm-scroller .cm-matchingBracket,
+.editor-host .cm-editor .cm-scroller .cm-nonmatchingBracket {
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  outline: var(--border-width) solid var(--background-modifier-border-focus);
+}
+/* Control, zero-width and bidi characters (a marked placeholder each). */
+.editor-host .cm-editor .cm-specialChar { color: var(--text-warning); }
+.editor-host .cm-editor .cm-searchMatch { background: var(--editor-find-match); }
+.editor-host .cm-editor .cm-searchMatch-selected { background: var(--editor-find-match); outline: var(--border-width) solid var(--text-accent); }
+
+/* A pasted image's base64 data, folded to one mark (editor.ts); the text is unchanged. */
+.editor-host .cm-editor .cm-data-fold {
+  padding: 0 var(--size-2-2);
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  color: var(--text-faint);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-smaller);
+  white-space: nowrap;
+}
+
+/* What a keystroke in a read-only document shows, at the caret. */
+.editor-host .cm-readonly-note {
+  position: absolute;
+  z-index: var(--layer-popover);
+  max-width: min(360px, calc(100% - var(--size-4-4)));
+  padding: var(--size-2-3) var(--size-4-2);
+  border: var(--border-width) solid var(--editor-widget-border);
+  border-radius: var(--radius-s);
+  background: var(--editor-widget-background);
+  box-shadow: var(--menu-shadow);
+  color: var(--editor-text);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-tight);
+  pointer-events: none;
+}
+.editor-host .cm-readonly-note[hidden] { display: none; }
+
+/* Find and replace (Cmd/Ctrl+F), above the text. */
+.editor-host .cm-editor .cm-panels {
+  border-color: var(--divider-color);
+  background: var(--editor-widget-background);
+  color: var(--editor-text);
+}
+.editor-host .cm-editor .cm-panels-top { border-bottom: var(--divider-width) solid var(--divider-color); }
+.editor-host .cm-editor .cm-panel.cm-search {
+  padding: var(--size-4-1) calc(var(--input-height) + var(--size-4-4)) var(--size-4-1) var(--size-4-3);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-small);
+}
+.editor-host .cm-editor .cm-panel.cm-search input,
+.editor-host .cm-editor .cm-panel.cm-search button,
+.editor-host .cm-editor .cm-panel.cm-search label {
+  margin: var(--size-2-2) var(--size-4-2) var(--size-2-2) 0;
+  vertical-align: middle;
+}
+.editor-host .cm-editor .cm-panel.cm-search label { color: var(--text-muted); font-size: var(--font-ui-small); }
+.editor-host .cm-editor .cm-panel.cm-search input[type=checkbox] { margin-right: var(--size-2-2); accent-color: var(--interactive-accent); }
+.editor-host .cm-editor .cm-panel :is(button, input[type=checkbox]):focus-visible { box-shadow: var(--focus-ring); }
+.editor-host .cm-editor .cm-textfield {
+  width: min(240px, 100%);
+  height: var(--input-height);
+  padding: var(--size-4-1) var(--size-4-2);
+  border: var(--border-width) solid var(--background-modifier-border);
+  border-radius: var(--input-radius);
+  background: var(--background-modifier-form-field);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+}
+.editor-host .cm-editor .cm-textfield:focus-visible { box-shadow: var(--input-focus-ring); }
+.editor-host .cm-editor .cm-button {
+  height: var(--input-height);
+  padding: 0 var(--size-4-2);
+  border: 0;
+  border-radius: var(--button-radius);
+  background: var(--interactive-normal);
+  box-shadow: var(--input-shadow);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-medium);
+}
+.editor-host .cm-editor .cm-button:hover { background: var(--interactive-hover); box-shadow: var(--input-shadow-hover); }
+.editor-host .cm-editor .cm-button:active { background: var(--interactive-hover); }
+.editor-host .cm-editor .cm-panel.cm-search [name=close] {
+  top: var(--size-4-1);
+  right: var(--size-4-3);
+  width: var(--input-height);
+  margin: var(--size-2-2) 0;
+  height: var(--input-height);
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  font-size: var(--font-ui-medium);
+  line-height: 1;
+}
+.editor-host .cm-editor .cm-panel.cm-search [name=close]:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+
+/* Syntax colours (classes from editor.ts): Obsidian's source mode. Marks
+   come after the text they mark, so a "#", "**" or "[" inside a heading,
+   emphasis or link is faint; code classes come last, so code inside a
+   Markdown fence keeps them over the block's colour. */
+.cm-editor .tok-heading { color: var(--md-heading); font-weight: var(--font-bold); }
+.cm-editor .tok-strong { color: var(--md-strong); font-weight: var(--font-bold); }
+.cm-editor .tok-emphasis { color: var(--md-emphasis); font-style: italic; }
+.cm-editor .tok-strikethrough { text-decoration: line-through; }
+.cm-editor .tok-link { color: var(--md-link); }
+.cm-editor .tok-url { color: var(--md-link-target); }
+.cm-editor .tok-code { color: var(--md-code); }
+.cm-editor .tok-code-block { color: var(--md-code-block); }
+.cm-editor .tok-quote { color: var(--md-quote); }
+.cm-editor .tok-list-mark { color: var(--md-list-marker); }
+.cm-editor .tok-mark,
+.cm-lang-markdown .tok-label,
+.cm-lang-markdown .tok-escape { color: var(--md-marker); }
+.cm-editor .tok-comment { color: var(--code-comment); font-style: italic; }
+.cm-editor .tok-tag { color: var(--code-tag); }
+.cm-editor .tok-property { color: var(--code-property); }
+.cm-editor .tok-string { color: var(--code-string); }
+.cm-editor .tok-value { color: var(--code-value); }
+.cm-editor .tok-keyword { color: var(--code-keyword); }
+.cm-editor .tok-function { color: var(--code-function); }
+.cm-editor .tok-important,
+.cm-lang-html .tok-escape { color: var(--code-important); }
+.cm-editor .tok-operator { color: var(--code-operator); }
+.cm-editor .tok-punctuation { color: var(--code-punctuation); }
+.cm-editor .tok-invalid { color: var(--text-error); }
 
 /* 10. Scrollbars, focus, selection, motion ---------------------------------- */
 
@@ -2333,6 +2447,8 @@ img, svg { flex: none; }
 
 :focus { outline: none; }
 :focus-visible { outline: none; box-shadow: var(--focus-ring); }
+/* A heading a fragment link moved the focus to (navigation.ts focusPaneTarget): no ring, as after a native fragment link. */
+.preview [tabindex="-1"]:focus-visible { box-shadow: none; }
 /* Icon buttons are dimmed at rest; a focused one is shown at full strength */
 .icon-button:focus-visible,
 .modal-close:focus-visible { opacity: var(--icon-opacity-hover); }
@@ -2344,13 +2460,13 @@ img, svg { flex: none; }
 .field input:focus-visible,
 .modal-form input:focus-visible,
 .search:focus-visible { box-shadow: var(--input-focus-ring); }
-.editor-host :focus-visible { box-shadow: none; }
+.editor-host :focus-visible,
+.preview:focus-visible { box-shadow: none; } /* the page being read takes the keys (arrow and page keys scroll it); no ring around all of it */
 
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
-    scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
@@ -2372,7 +2488,7 @@ img, svg { flex: none; }
    The smaller margins are set on the two panes that use them, not on :root:
    changing a custom property on :root restyles every element, which took
    about 430 ms in WebKit with the 2,900-heading outline of a 12 MB document
-   open (monaco.ts reads the editor's margin from its own element). */
+   open. */
 
 @media (max-width: 850px) {
   .editor-host,

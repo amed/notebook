@@ -6,13 +6,13 @@ import { kindName, type TreeNode } from "./ipc";
 import type { TreeItem, TreeModel } from "./tree-model";
 import { icon } from "./ui/primitives";
 
-export interface TreeViewState {
+interface TreeViewState {
   selected: string;
   expanded: ReadonlySet<string>;
   query: string;
 }
 
-export interface TreeActions {
+interface TreeActions {
   activate(id: string): void;
   rename(id: string): void;
   menu(id: string, x: number, y: number): void;
@@ -22,7 +22,7 @@ export interface TreeActions {
 }
 
 /** Search shows at most this many rows, then "N more". */
-export const SEARCH_LIMIT = 200;
+const SEARCH_LIMIT = 200;
 const NODE_TYPE = "text/x-notebook-node";
 
 type Row = { element: HTMLElement; label: HTMLElement; disclosure: HTMLElement; name: string; depth: number; open: boolean | null };
@@ -208,7 +208,7 @@ function setSelected(element: HTMLElement, selected: boolean): void {
  * rows that left are removed, new rows are inserted in runs, and rows that
  * stay are moved only when their order changed.
  */
-export function reconcile(host: HTMLElement, desired: readonly HTMLElement[]): void {
+function reconcile(host: HTMLElement, desired: readonly HTMLElement[]): void {
   const keep = new Set(desired);
   for (const child of [...host.children]) if (!keep.has(child as HTMLElement)) child.remove();
   let cursor = host.firstElementChild;

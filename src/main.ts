@@ -1,31 +1,26 @@
 import { type DocumentData, DocumentSession, SAVE_TIMING, type SyncState, within } from "./documents";
-import { listen } from "@tauri-apps/api/event";
-import { errorCode, ipc, type RestoreResult, type ThemePreference, type TreeDelta, type TreeNode, type WorkspaceList, type WorkspaceSummary, kindName, safeErrorMessage } from "./ipc";
-import {
-  createEditor,
-  disposeModels,
-  freezeEditor,
-  languageForFile,
-  openModel,
-  retargetModel,
-  setEditorLanguage,
-  setSoftWrap,
-  setTheme,
-  softWrapEnabled,
-  type DocumentLanguage,
-} from "./editor/monaco";
+import type { EventCallback, UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type DocumentLink, errorCode, type HeldMove, ipc, isIpcFailure, type RestoreResult, type ThemePreference, type TreeDelta, type TreeNode, type WorkspaceList, type WorkspaceSummary, kindName, safeErrorMessage } from "./ipc";
+import { EDITING_ELSEWHERE, EDITING_ELSEWHERE_HINT, documentWindowProblem, documentWindowRequest, documentWindowUrl } from "./document-window";
+import { type DocumentLanguage, Editor, languageForFile, softWrapEnabled } from "./editor/editor";
 import { patchChildren } from "./dom-patch";
 import { parseVaultFilePath } from "./file-path";
+import { type DroppedEntry, IMPORT_PARALLEL, type Skip, foldersByLevel, importProgress, importStopped, importSummary, limitMessage, planImport, readImportText, runPool, scanDrop, uniqueName as uniqueAmong } from "./folder-import";
 import { HtmlPreview, SAFE_IMAGE_SRC } from "./html-preview";
-import { MAX_LINK_LENGTH, openInBrowserTab, setExternalLinkHandler } from "./navigation";
-import { parseMarkdownOutline, type OutlineItem } from "./outline";
+import { focusPaneTarget, MAX_LINK_LENGTH, openAppWindow, openInBrowserTab, previewTarget, scrollPaneTo, setExternalLinkHandler, setInternalLinkHandler } from "./navigation";
+import { headingText, parseMarkdownOutline, type OutlineItem } from "./outline";
 import { DEFAULT_LAYOUT, type PanelLayout, layoutToWire } from "./panel-layout";
 import { PanelResizers } from "./panel-resizer";
+import { ZOOM, type ZoomKey, zoomed, zoomKey } from "./preview-zoom";
 import { ROOT_ID as ROOT, TRASH_ID as TRASH, TreeModel } from "./tree-model";
 import { TreeView } from "./tree-view";
+import { type HeadingTrack, type PreviewMode, type WritingMode, lastAtOrBefore, lineForPreviewOffset, modeAfterFocus, previewOffsetForLine, toggledMode, viewKey } from "./view-mode";
 import { type ContextAction, ContextMenu, icon } from "./ui/primitives";
 import { countText } from "./word-count";
-import { ACCENTS, type Accent, DEFAULT_ACCENT, applyAccent } from "./theme";
+import { HeadingIds, type InternalLink, type VaultEntry, VaultIndex, fragmentIds, parseInternalHref, pathIndex, previewHref, resolveInternalLink, wikiHref } from "./vault-links";
+import { ACCENTS, type Accent, DEFAULT_ACCENT, applyAccent, setTheme } from "./theme";
 import {
   MemoryWorkspaces,
   type WorkspaceFormValues,
@@ -44,18 +39,58 @@ import {
   workspaceInput,
 } from "./workspaces";
 
-type PreviewMode = "edit" | "split" | "preview";
 /** What the window shows; screens other than "main" hold no decrypted data. */
 type Screen = "starting" | "blocked" | "connect" | "opening" | "unlock" | "main";
 
+/** The preview's top block and how far into it the top is; an HTML page's scroll share. */
+type PreviewPlace = { element: Element; fraction: number; offset: number } | { ratio: number };
+
+/** Where the reader is, taken before a view or focus mode change (readingPlace). */
+type ReadingPlace = {
+  /** The editor's top line, when it was shown. */
+  editorLine: number | null;
+  /** The preview's top block, when it was shown. */
+  previewBlock: PreviewPlace | null;
+  /** The source line at the preview's top, when only the preview was shown. */
+  previewLine: number | null;
+};
+
 const isTauri = "__TAURI_INTERNALS__" in window;
 const isMac = navigator.platform.includes("Mac");
+/** A document window (window.rs, document-window.ts): one document, nothing else. */
+const DOCUMENT_WINDOW = documentWindowRequest(location.search);
+/** Shortcut hints in tooltips and menus. */
+const READ_WRITE_KEYS = isMac ? "⌘⇧V" : "Ctrl+Shift+V";
+const NEW_WINDOW_KEYS = isMac ? "⌘⇧O" : "Ctrl+Shift+O";
+/** The content zoom is saved this long after its last change (one IPC per burst of zoom keys). */
+const ZOOM_SAVE_DELAY_MS = 500;
+/** How long the zoom level shows after a zoom key before it fades out (zoomContent). */
+const ZOOM_NOTE_MS = 1000;
+const APP_TITLE = "Notebook";
+/**
+ * A document window stays read-only while Rust renames, moves or trashes its
+ * document (flushForRename until document-window-resume); after this long it
+ * writes again whatever happens, and Rust still refuses an early edit (BUSY).
+ */
+const MOVE_FREEZE_MAX_MS = 120_000;
 const PREVIEW_DELAY_MS = 300;
+/**
+ * Outline rows drawn at a time; the next ones follow as the outline scrolls
+ * (a 12 MB document has 36k headings, and a DOM of them all froze WebKit
+ * for seconds).
+ */
+const OUTLINE_CHUNK = 400;
+/** How often a focused HTML page frame is checked for a selection (syncFrameWatch). */
+const FRAME_FOCUS_POLL_MS = 250;
+/** One arrow key's scroll of an HTML page from its preview (scrollFrame), as WebKit scrolls a page. */
+const FRAME_LINE_PX = 40;
 /** Above this, the preview renders only when asked (the Render button). */
 const LARGE_PREVIEW_CHARS = 512 * 1024;
+/** The preview's top-level headings: the source's headings, in the same order. */
+const PREVIEW_HEADINGS = ":scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6";
+const ALL_HEADINGS = "h1, h2, h3, h4, h5, h6";
 const MAX_PREVIEW_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-const MAX_IMPORT_BYTES = 16 * 1024 * 1024;
 const IMAGE_TYPE = /^image\/(png|jpeg|gif|webp)$/i;
 const HTML_STARTER = `<!doctype html>
 <html lang="en">
@@ -91,9 +126,9 @@ const sampleNodes: TreeNode[] = [
 
 /** Browser mode: a fresh copy each time the sample workspace opens (lock clears it). */
 const sampleDocs = (): Map<string, DocumentData> => new Map<string, DocumentData>([
-  ["d1", { readOnly: false, text: `# Notebook\n\nYour notes are encrypted **before** they reach S3. Names, folder structure, and contents use the same client-side encryption format as \`amed/notebook\`.\n\n## What is protected\n\n- Document and folder names\n- Markdown contents\n- Images and deleted items\n- The encryption phrase stays on this device\n\n> Open **Project Pipeline / games.md** to continue where the existing Notebook workspace left off.\n` }],
-  ["d2", { readOnly: false, text: `# Games pipeline\n\nA focused workspace for the current game research pipeline.\n\n## Next up\n\n- [x] Define the collection model\n- [x] Encrypt filenames and content before upload\n- [ ] Add cover-image paste and drag support\n- [ ] Review the release checklist\n\n## Storage format\n\nEach path segment is encrypted with **AES-256-GCM-SIV** and encoded as base64url. Document bodies use a fresh 12-byte nonce followed by authenticated ciphertext.\n\nThis means the same bucket can be opened by both Notebook and this app.\n` }],
-  ["d3", { readOnly: false, text: `# Roadmap\n\n## Now\n\n1. Legacy bucket compatibility\n2. Fast Monaco editing\n3. Reliable background saves\n\n## Later\n\n- Cross-device conflict UI\n- Encrypted image cache\n- Release signing\n` }],
+  ["d1", { readOnly: false, text: `# Notebook\n\nYour notes are encrypted **before** they reach S3. Names, folder structure, and contents use the same client-side encryption format as \`amed/notebook\`.\n\n## What is protected\n\n- Document and folder names\n- Markdown contents\n- Images and deleted items\n- The encryption phrase stays on this device\n\n> Open **Project Pipeline / games.md** to continue where the existing Notebook workspace left off.\n\n## Links\n\nJump to [what is protected](#what-is-protected), read the [storage format](Project%20Pipeline/games.md#storage-format), see [[Roadmap#Later|what comes later]] or the [[Reading list]]. A link to a [missing note](Nowhere.md) says so.\n` }],
+  ["d2", { readOnly: false, text: `# Games pipeline\n\nA focused workspace for the current game research pipeline.\n\n## Next up\n\n- [x] Define the collection model\n- [x] Encrypt filenames and content before upload\n- [ ] Add cover-image paste and drag support\n- [ ] Review the release checklist\n\n## Storage format\n\nEach path segment is encrypted with **AES-256-GCM-SIV** and encoded as base64url. Document bodies use a fresh 12-byte nonce followed by authenticated ciphertext.\n\nThis means the same bucket can be opened by both Notebook and this app.\n\nBack to [the welcome page](../Welcome.md#links), up to [the project folder](./), or on to [[Roadmap]].\n` }],
+  ["d3", { readOnly: false, text: `# Roadmap\n\n## Now\n\n1. Legacy bucket compatibility\n2. Fast editing\n3. Reliable background saves\n\n\`\`\`sh\n# Not a heading: fenced code\n\`\`\`\n\n## Later\n\n- Cross-device conflict UI\n- Encrypted image cache\n- Release signing\n` }],
   ["d4", { readOnly: false, text: `# Reading list\n\n- Cryptographic Engineering\n- Designing Data-Intensive Applications\n- The Rustonomicon (carefully)\n` }],
   ["d5", { readOnly: false, text: `<!doctype html>
 <html lang="en">
@@ -129,38 +164,93 @@ declare global {
   interface Window {
     /** Called by Rust when the window closes while unlocked (window.rs). */
     __notebookBeforeClose?: () => Promise<void>;
+    /** Document windows: called by Rust before a rename, move or Trash of their document (window.rs). */
+    __notebookFlush?: (request: number) => Promise<void>;
   }
 }
 
+
+/**
+ * Rust sends its events to one window (`emit_to`). The global `listen`
+ * would also receive those meant for other windows, so each window listens
+ * on itself only (Rust's `emit` to all still arrives).
+ */
+function listenHere<T>(event: string, handler: EventCallback<T>): Promise<UnlistenFn> {
+  return getCurrentWebviewWindow().listen<T>(event, handler);
+}
+
+let linkChannel: BroadcastChannel | null = null;
+/** Browser mode: document windows hand vault links to the main window here (the app goes through Rust). */
+function documentLinks(): BroadcastChannel | null {
+  if (isTauri || typeof BroadcastChannel === "undefined") return null;
+  linkChannel ??= new BroadcastChannel("notebook-document-links");
+  return linkChannel;
+}
 class App {
   private root = document.querySelector<HTMLElement>("#app")!;
   /** The vault's tree; changes arrive as deltas, Refresh lists S3 again. */
   private tree = treeOf(sampleNodes);
   private treeView: TreeView | null = null;
   private resyncTimer: number | null = null;
+  /** A draw of the tree waiting for the next frame (drawSoon). */
+  private drawFrame: number | null = null;
+  /** A drop is being imported; another waits for it. */
+  private importing = false;
+  /** Browser mode: what each Trash entry holds, for Restore. */
+  private localTrash = new Map<string, TreeNode[]>();
   private docs = sampleDocs();
   private selected = "d2";
   private expanded = new Set([ROOT, "f1"]);
   private previewMode: PreviewMode = "split";
-  private editor: ReturnType<typeof createEditor> | null = null;
+  /** The writing mode Cmd+Shift+V goes back to from Preview (Edit or Split). */
+  private writingMode: WritingMode = "split";
+  /** F9: the document alone, without sidebar, header, status bar or outline; the window title is its name. */
+  private focusMode = false;
+  /** The view mode focus mode started from; leaving it gives it back (modeAfterFocus). */
+  private modeBeforeFocus: PreviewMode = "split";
+  /** The OS window title last set: "Notebook", or the file name in focus mode. */
+  private windowTitle = APP_TITLE;
+  /** Focus mode on an HTML page: takes the keys back from the page's frame (syncFrameWatch). */
+  private frameWatch: number | null = null;
+  /**
+   * A document window (spec D): one document in focus mode, no sidebar,
+   * header, status bar or workspace; Rust says which document it holds.
+   */
+  private readonly docWindow = DOCUMENT_WINDOW !== null;
+  /** Main window: another window writes the open document, so it is read-only here (spec E). */
+  private openElsewhere = false;
+  /** Document window: renames, moves or Trash of its document under way (flushForRename). */
+  private moveFreezes = 0;
+  private moveThaw: (() => void) | null = null;
+  private moveTimer: number | null = null;
+  /** Main window: a lock, switch or quit is closing the workspace; document windows closing then change nothing here. */
+  private exiting = false;
+  private editor: Editor | null = null;
   // Edits go to the encrypted local outbox within a second and to S3 on
   // Cmd/Ctrl+S, switch, blur, close, lock, 30 s idle or 120 s of typing.
   private documents = new DocumentSession({
     open: async (id) => {
       if (!isTauri) return this.docs.get(id) ?? { text: "", readOnly: false };
-      // Opened or saved before: Rust answers from its cache, without S3.
-      const opened = await ipc.docOpen(id);
-      return { text: opened.text, readOnly: opened.read_only, dirty: opened.dirty };
+      // Opened or saved before: Rust answers from its cache, without S3,
+      // and leaves out a text the editor still holds (a switch back).
+      let opened = await ipc.docOpen(id, this.editor?.revOf(id) ?? null);
+      // The editor let its copy go meanwhile.
+      if (opened.text === null && this.editor?.revOf(id) !== opened.rev) opened = await ipc.docOpen(id);
+      return { text: opened.text, readOnly: opened.read_only, dirty: opened.dirty, rev: opened.rev };
     },
     stage: async (id, text) => {
-      if (isTauri) return ipc.docStage(id, text);
+      if (isTauri) {
+        const staged = await ipc.docStage(id, text);
+        this.editor?.staged(id, text, staged.rev);
+        return staged.status;
+      }
       this.docs.set(id, { text, readOnly: false });
       return "Staged";
     },
     commit: async (id) => {
       if (!isTauri) return { status: "Saved" };
       const result = await ipc.docCommit(id);
-      // A conflict copy joins the tree.
+      // A conflict copy joins the tree (a document window has none).
       this.applyTree(result.tree);
       return result;
     },
@@ -179,7 +269,24 @@ class App {
   private previewDoc: string | null = null;
   /** A document switch: the next full preview render starts at the top. */
   private previewFromTop = false;
+  /** A source line the preview scrolls to once its render (in flight) is in (showPreviewLine). */
+  private previewLineWanted: number | null = null;
+  /** The render awaiting Rust's preview_render, if any. */
+  private previewInFlight: number | null = null;
+  /** A link's #heading, shown once the preview shows the current text of document `id` (revealFragment). */
+  private pendingFragment: { id: string; fragment: string } | null = null;
+  /** Document window, browser mode: its document's vault path (the app asks Rust at each link). */
+  private docWindowPath = "";
+  /** The source lines of the open Markdown document's headings, for the reading position. */
+  private headingLineCache: { key: string; lines: readonly number[] } | null = null;
   private outlineKey: string | null = null;
+  /** The document and headings the outline shows; the same again draws nothing. */
+  private outlineSignature: string | null = null;
+  /** The outline's rows in order, collapsed branches left out; the first `outlineDrawn` are in the DOM. */
+  private outlineRows: OutlineItem[] = [];
+  private outlineDrawn = 0;
+  /** Draws the next rows once the end of the drawn ones nears the view. */
+  private outlineObserver: IntersectionObserver | null = null;
   /** Typing debounce: one timer, re-armed only when it fires early. */
   private renderTimer: number | null = null;
   private renderDueAt = 0;
@@ -187,7 +294,15 @@ class App {
   private previewSeq = 0;
   private pausedNote: HTMLElement | null = null;
   private wordCount: { panel: HTMLElement; close: () => void } | null = null;
-  private htmlPreview = new HtmlPreview((url) => void this.openExternalLink(url));
+  private htmlPreview = new HtmlPreview((url) => void this.openExternalLink(url), () => this.showPreviewChrome());
+  /** Content zoom in percent (preview-zoom.ts): the editor's and the preview's text, global; saved 500 ms after the last change. */
+  private contentZoom: number = ZOOM.default;
+  private savedZoom: number = ZOOM.default;
+  private zoomSaveTimer: number | null = null;
+  /** Each shown pane's reading position before a burst of zoom steps, given back in the next frame (zoomContent). */
+  private zoomPlace: { editorLine: number | null; preview: PreviewPlace | null } | null = null;
+  private zoomFrame: number | null = null;
+  private zoomNoteTimer: number | null = null;
   /** Rust in the app; browser mode (`npm run dev`) keeps sample workspaces in memory. */
   private workspaces: WorkspaceStore = isTauri ? tauriWorkspaces() : browserWorkspaces();
   private workspaceList: WorkspaceList = { workspaces: [], active: null };
@@ -220,25 +335,47 @@ class App {
   async start(): Promise<void> {
     setTheme("System");
     setExternalLinkHandler((url) => void this.openExternalLink(url));
+    setInternalLinkHandler((href) => this.followVaultLink(href));
     window.__notebookBeforeClose = () => this.beforeClose();
     this.watchModals();
+    if (DOCUMENT_WINDOW) {
+      await this.startDocumentWindow(DOCUMENT_WINDOW.id);
+      return;
+    }
     if (isTauri) {
-      await listen<boolean>("auto-lock", (event) => {
+      await listenHere<boolean>("auto-lock", (event) => {
         if (event.payload) this.forcedLock();
         else void this.lock(true);
       });
+      // Document windows (window.rs): their commits and closes change what this window may write.
+      await listenHere<{ id: string; tree?: TreeDelta | null }>("document-committed", (event) => {
+        if (this.screen === "main") this.applyTree(event.payload.tree);
+        void this.writerChanged(event.payload.id);
+      });
+      await listenHere<string>("document-window-closed", (event) => void this.writerChanged(event.payload));
+      await listenHere<string[]>("document-windows-gone", (event) => {
+        const names = event.payload.map((name) => `“${name}”`).join(", ");
+        void this.message("Window closed", `${names} moved to the Trash, so ${event.payload.length === 1 ? "its window was" : "their windows were"} closed. Your edits were saved first.`);
+      });
+      // Typing in a document window keeps the workspace open.
+      await listenHere("window-activity", () => this.armIdleLock());
+      // A document window's link to another document (window.rs document_link_open).
+      await listenHere<DocumentLink>("document-link", (event) => this.openLinkFromWindow(event.payload));
       try {
         const config = await ipc.configGet();
         this.autoLockMinutes = config.auto_lock_minutes;
         this.theme = config.theme;
         this.accent = config.accent;
         this.panelLayout = config.layout;
+        this.contentZoom = this.savedZoom = config.preview_zoom;
         applyAccent(config.accent);
         setTheme(config.theme);
       } catch {
         /* The defaults stay; the workspace list below decides what to show. */
       }
     }
+    // Browser mode: document windows hand their links over here.
+    documentLinks()?.addEventListener("message", (event: MessageEvent<DocumentLink>) => this.openLinkFromWindow(event.data));
     try {
       this.workspaceList = await this.workspaces.list();
     } catch (caught) {
@@ -261,6 +398,133 @@ class App {
     screen.querySelector(".auth-logo")!.append(icon(inUse ? "lock" : "warning"));
     setText(screen.querySelector("h1"), inUse ? "Notebook is already open" : "Notebook could not start");
     setText(screen.querySelector("p"), authErrorMessage(caught, "Quit Notebook and open it again."));
+  }
+
+  /**
+   * A document window (spec D): Rust says which document this window holds
+   * (by its label, for the session it was opened in), and the page shows
+   * only that document, in focus mode and in Preview. Cmd/Ctrl+Shift+V
+   * switches to writing, Cmd/Ctrl+S uploads, and closing saves first (the
+   * close guard). F9 and Esc do nothing: there is no chrome to bring back.
+   * The URL's id is only what the page asked for; it never decides anything.
+   */
+  private async startDocumentWindow(requested: string): Promise<void> {
+    let held: { id: string; name: string };
+    if (isTauri) {
+      window.__notebookFlush = (request) => this.flushForRename(request);
+      await listenHere<HeldMove>("document-window-moved", (event) => this.heldMoved(event.payload));
+      await listenHere("document-window-resume", () => this.resumeAfterMove());
+      try {
+        const info = await ipc.documentWindowInfo();
+        this.theme = info.theme;
+        this.accent = info.accent;
+        applyAccent(info.accent);
+        setTheme(info.theme);
+        this.contentZoom = this.savedZoom = info.preview_zoom;
+        held = info;
+        this.docWindowPath = info.path;
+      } catch (caught) {
+        this.renderWindowProblem(errorCode(caught));
+        return;
+      }
+    } else {
+      // Browser mode: the sample documents stand in for Rust.
+      const node = sampleNodes.find((item) => item.id === requested && kindName(item) === "Document");
+      if (!node) {
+        this.renderWindowProblem("INVALID_INPUT");
+        return;
+      }
+      held = node;
+      this.docWindowPath = treeOf(sampleNodes).pathOf(node.id);
+    }
+    this.tree = treeOf([
+      { id: ROOT, parent: null, name: "Vault", kind: "Root" },
+      { id: held.id, parent: ROOT, name: held.name, kind: "Document" },
+    ]);
+    this.selected = held.id;
+    this.expanded = new Set([ROOT]);
+    this.focusMode = true;
+    this.previewMode = "preview";
+    this.renderMain();
+    this.showWindowTitle(held.name);
+    // Arrow, page and space keys read the document at once.
+    this.focusPane();
+  }
+
+  /** A document window with nothing to show: why, and a way to close it. */
+  private renderWindowProblem(code: string | null): void {
+    this.screen = "blocked";
+    const problem = documentWindowProblem(code);
+    const screen = this.authScreen();
+    screen.innerHTML = `<section class="auth-card" role="alert"><div class="auth-logo"></div><h1></h1><p></p><div class="auth-actions"><span class="auth-spacer"></span><button class="button button-primary" type="button">Close window</button></div></section>`;
+    screen.querySelector(".auth-logo")!.append(icon(code === "INVALID_INPUT" ? "document" : "lock"));
+    setText(screen.querySelector("h1"), problem.title);
+    setText(screen.querySelector("p"), problem.detail);
+    const close = screen.querySelector<HTMLButtonElement>("button")!;
+    close.addEventListener("click", () => {
+      if (isTauri) void ipc.documentWindowClose().catch(() => { /* The window's own close button still works. */ });
+      else window.close();
+    });
+    close.focus();
+    document.title = problem.title;
+  }
+
+  /**
+   * Document window: Rust renames, moves or trashes this document next. The
+   * pending edit goes to the outbox first (it is uploaded before the move),
+   * and the editor stays read-only until Rust says the change is over
+   * (resumeAfterMove): an edit typed meanwhile would go to a key that is
+   * about to disappear, and a trashed document's window closes.
+   */
+  private async flushForRename(request: number): Promise<void> {
+    if (this.editor && this.moveFreezes++ === 0) {
+      this.moveThaw = this.editor.freeze("Wait a moment: this document is being renamed or moved…");
+      this.documents.hold();
+    }
+    if (this.moveTimer !== null) clearTimeout(this.moveTimer);
+    this.moveTimer = window.setTimeout(() => this.resumeAfterMove(true), MOVE_FREEZE_MAX_MS);
+    await this.documents.persist();
+    try { await ipc.documentWindowFlushed(request); } catch { /* Rust stops waiting after 2 s. */ }
+  }
+
+  /**
+   * Document window: the rename, move or Trash is over (or failed). The
+   * editor writes again, and an edit Rust refused meanwhile (BUSY) is
+   * written and uploaded under the document's id, new or not.
+   */
+  private resumeAfterMove(all = false): void {
+    if (this.moveFreezes === 0) return;
+    this.moveFreezes = all ? 0 : this.moveFreezes - 1;
+    if (this.moveFreezes > 0) return;
+    if (this.moveTimer !== null) clearTimeout(this.moveTimer);
+    this.moveTimer = null;
+    this.moveThaw?.();
+    this.moveThaw = null;
+    this.documents.release();
+    void this.documents.persist().then(() => this.documents.retryNow());
+  }
+
+  /**
+   * Document window: a rename or move gave this document a new id and name
+   * (Rust retitled the window), or the edit became a conflict copy that
+   * this window writes now. The editor keeps its model and undo history.
+   */
+  private heldMoved(change: HeldMove): void {
+    const node = this.tree.get(change.from) ?? this.tree.get(change.to);
+    if (!node || !this.editor) return;
+    if (change.from !== change.to && this.tree.has(change.from)) {
+      this.tree.change([{ ...node, id: change.to, name: change.name }], [change.from]);
+      this.selected = change.to;
+      if (this.documents.openId === change.from) this.documents.retarget(change.from, change.to);
+      this.retargetOpen(change.from, change.to);
+    } else {
+      this.tree.change([{ ...node, name: change.name }]);
+    }
+    const shown = this.tree.get(change.to);
+    if (!shown) return;
+    this.showDocumentName(shown);
+    this.showWindowTitle(shown.name);
+    this.applyPreviewMode();
   }
 
   /** Starts a new auth step; unlocks started before it are dropped when they answer. */
@@ -545,10 +809,10 @@ class App {
   }
 
   private renderMain(): void {
-    this.root.innerHTML = `<main class="shell">
+    this.root.innerHTML = `<main class="shell${this.focusMode ? " focus-mode" : ""}${this.docWindow ? " document-window" : ""}">
       <section class="workspace"><aside class="sidebar"><div class="side-heading"><button class="workspace-picker" id="workspace-picker" type="button" aria-haspopup="menu" aria-expanded="false"><span class="workspace-avatar"></span><span class="workspace-picker-name"></span><span class="workspace-picker-chevron"></span></button><div class="side-actions"><button class="icon-button header-action" id="new-file" type="button" title="New file" aria-label="New file"></button><button class="icon-button header-action" id="new-folder" type="button" title="New folder" aria-label="New folder"></button></div></div><div class="search-wrap"><span></span><input class="search" placeholder="Quick open…" aria-label="Search titles" autocomplete="off" spellcheck="false"><button class="icon-button search-clear" id="search-clear" type="button" title="Clear search" aria-label="Clear search" hidden></button></div><div class="tree" role="tree"></div><div class="side-bottom"><button class="trash-button"><span></span><span>Trash</span><span class="trash-count">0</span></button></div><div class="file-drop-hint" aria-hidden="true"><span class="file-drop-icon"></span><strong>Import files</strong><span>Drop Markdown, text, or HTML here</span></div></aside><div class="panel-resizer sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" title="Drag to resize, double-click to reset" tabindex="0"></div>
-      <section class="content"><header class="document-bar"><div class="doc-breadcrumb"><span class="doc-folders" hidden><bdi dir="ltr"></bdi></span><span class="doc-separator" aria-hidden="true" hidden>/</span><span class="doc-title"></span></div><div class="header-actions"><button class="icon-button header-action" id="outline-toggle" type="button" aria-expanded="false" title="Outline" aria-label="Outline"></button><div class="segmented" role="group" aria-label="View mode"><button class="icon-button header-action" type="button" data-mode="edit" title="Edit" aria-label="Edit" aria-pressed="false"></button><button class="icon-button header-action" type="button" data-mode="split" title="Split" aria-label="Split" aria-pressed="false"></button><button class="icon-button header-action" type="button" data-mode="preview" title="Preview" aria-label="Preview" aria-pressed="false"></button></div><span class="header-divider" aria-hidden="true"></span><button class="icon-button header-action" id="refresh" type="button" title="Refresh" aria-label="Refresh"></button><button class="icon-button header-action" id="settings" type="button" title="Settings" aria-label="Settings"></button><button class="icon-button header-action" id="lock" type="button" title="Lock workspace" aria-label="Lock workspace"></button></div></header><div class="editor-area"><aside class="outline-panel" aria-label="Document outline"><header><strong>Outline</strong><div><button type="button" id="outline-expand" title="Expand all headings">Expand</button><button type="button" id="outline-collapse" title="Collapse all headings">Collapse</button><button class="icon-button outline-close" id="outline-close" type="button" title="Close outline" aria-label="Close outline"></button></div></header><div class="outline-tree" role="tree" aria-label="Markdown headings"></div></aside><div class="panel-resizer outline-resizer" role="separator" aria-orientation="vertical" aria-label="Resize outline" title="Drag to resize, double-click to reset" tabindex="0"></div><div class="editor-host"></div><div class="panel-resizer split-resizer" role="separator" aria-orientation="vertical" aria-label="Resize editor and preview" title="Drag to resize, double-click to reset" tabindex="0"></div><article class="preview"></article></div></section><div class="resize-overlay" aria-hidden="true" hidden></div></section>
-      <footer class="statusbar"><button class="sync clean" type="button" title="Saved" aria-label="Saved"><span class="sync-dot"></span><span class="sync-label"></span></button><span class="encryption-label">End-to-end encrypted</span><span class="status-spacer"></span><button class="status-button" id="word-count" type="button" aria-haspopup="dialog" aria-expanded="false">Word count</button><button class="status-button" id="soft-wrap" type="button" aria-pressed="true">Wrap</button><span>UTF-8</span><span class="language-label">Markdown</span></footer>
+      <section class="content"><header class="document-bar"><div class="doc-breadcrumb"><span class="doc-folders" hidden><bdi dir="ltr"></bdi></span><span class="doc-separator" aria-hidden="true" hidden>/</span><span class="doc-title"></span></div><button class="elsewhere-note" id="elsewhere" type="button" title="Editing in another window: click to show it" aria-label="Editing in another window: show it" hidden></button><div class="header-actions"><button class="icon-button header-action" id="outline-toggle" type="button" aria-expanded="false" title="Outline" aria-label="Outline"></button><div class="segmented" role="group" aria-label="View mode"><button class="icon-button header-action" type="button" data-mode="edit" title="Edit (${READ_WRITE_KEYS} to read)" aria-label="Edit" aria-pressed="false"></button><button class="icon-button header-action" type="button" data-mode="split" title="Split (${READ_WRITE_KEYS} to read)" aria-label="Split" aria-pressed="false"></button><button class="icon-button header-action" type="button" data-mode="preview" title="Preview (${READ_WRITE_KEYS} to write, F9 focus mode)" aria-label="Preview" aria-pressed="false"></button></div><button class="icon-button header-action" id="open-window" type="button" disabled title="Open in new window (${NEW_WINDOW_KEYS})" aria-label="Open in new window"></button><span class="header-divider" aria-hidden="true"></span><button class="icon-button header-action" id="refresh" type="button" title="Refresh" aria-label="Refresh"></button><button class="icon-button header-action" id="settings" type="button" title="Settings" aria-label="Settings"></button><button class="icon-button header-action" id="lock" type="button" title="Lock workspace" aria-label="Lock workspace"></button></div></header><div class="editor-area"><aside class="outline-panel" aria-label="Document outline"><header><strong>Outline</strong><div><button type="button" id="outline-expand" title="Expand all headings">Expand</button><button type="button" id="outline-collapse" title="Collapse all headings">Collapse</button><button class="icon-button outline-close" id="outline-close" type="button" title="Close outline" aria-label="Close outline"></button></div></header><div class="outline-tree" role="tree" aria-label="Markdown headings"></div></aside><div class="panel-resizer outline-resizer" role="separator" aria-orientation="vertical" aria-label="Resize outline" title="Drag to resize, double-click to reset" tabindex="0"></div><div class="editor-host"></div><div class="panel-resizer split-resizer" role="separator" aria-orientation="vertical" aria-label="Resize editor and preview" title="Drag to resize, double-click to reset" tabindex="0"></div><article class="preview" tabindex="-1"></article><div class="zoom-indicator" role="status" aria-live="polite" aria-atomic="true"><span class="zoom-indicator-label">Zoom </span><span class="zoom-indicator-level"></span></div></div></section><div class="resize-overlay" aria-hidden="true" hidden></div></section>
+      <footer class="statusbar"><button class="sync clean" type="button" title="Saved" aria-label="Saved"><span class="sync-dot"></span><span class="sync-label"></span></button><span class="encryption-label">End-to-end encrypted</span><span class="status-spacer"></span><span class="scripts-off" id="scripts-off" hidden></span><button class="status-button" id="word-count" type="button" aria-haspopup="dialog" aria-expanded="false">Word count</button><button class="status-button" id="soft-wrap" type="button" aria-pressed="true">Wrap</button><span>UTF-8</span><span class="language-label">Markdown</span></footer>
     </main>`;
     this.screen = "main";
     this.root.querySelector(".workspace-picker-chevron")!.append(icon("chevron"));
@@ -561,6 +825,13 @@ class App {
     this.root.querySelector('[data-mode="edit"]')!.append(icon("pencil"));
     this.root.querySelector('[data-mode="split"]')!.append(icon("columns"));
     this.root.querySelector('[data-mode="preview"]')!.append(icon("preview"));
+    this.root.querySelector("#open-window")!.append(icon("window"));
+    const elsewhere = this.root.querySelector<HTMLElement>("#elsewhere")!;
+    const elsewhereLabel = document.createElement("span");
+    elsewhereLabel.className = "elsewhere-label";
+    elsewhereLabel.textContent = EDITING_ELSEWHERE;
+    // A narrow header shows only the icon (theme.css); the name keeps the room.
+    elsewhere.append(icon("window"), elsewhereLabel);
     this.showSoftWrap();
     this.root.querySelector(".search-wrap span")!.append(icon("search"));
     this.root.querySelector("#search-clear")!.append(icon("close"));
@@ -568,10 +839,9 @@ class App {
     this.root.querySelector(".trash-button span")!.append(icon("trash"));
     this.root.querySelector(".file-drop-icon")!.append(icon("archive"));
     const editorHost = this.root.querySelector<HTMLElement>(".editor-host")!;
-    this.editor = createEditor(editorHost);
-    this.editor.onDidChangeModelContent(() => this.onTextChanged());
+    this.editor = new Editor(editorHost, () => this.onTextChanged());
     editorHost.addEventListener("paste", (event) => void this.onImagePaste(event), true);
-    // Capture phase, ahead of Monaco; navigation.ts still refuses every other drop.
+    // Capture phase, ahead of the editor; navigation.ts still refuses every other drop.
     editorHost.addEventListener("dragover", this.onImageDragOver, true);
     editorHost.addEventListener("drop", (event) => void this.onImageDrop(event), true);
     this.treeView = new TreeView(this.root.querySelector<HTMLElement>(".tree")!, this.tree, {
@@ -622,8 +892,12 @@ class App {
     clear.addEventListener("mousedown", (event) => event.preventDefault());
     clear.addEventListener("click", () => this.clearSearch());
     this.root.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((button) => button.addEventListener("click", () => {
-      this.previewMode = button.dataset.mode as PreviewMode;
+      const mode = button.dataset.mode as PreviewMode;
+      if (mode === this.previewMode) return;
+      const place = this.readingPlace();
+      this.previewMode = mode;
       this.applyPreviewMode();
+      this.restoreReadingPlace(place);
     }));
     this.root.querySelector("#new-file")!.addEventListener("click", () => void this.createFile());
     this.root.querySelector("#new-folder")!.addEventListener("click", () => void this.createFolder());
@@ -637,12 +911,28 @@ class App {
       this.renderOutline(true);
     });
     this.root.querySelector("#outline-collapse")!.addEventListener("click", () => {
-      this.collapsedOutline = new Set(flattenOutline(parseMarkdownOutline(this.editor?.getValue() ?? "")).filter((item) => item.children.length).map((item) => item.id));
+      this.collapsedOutline = new Set(flattenOutline(parseMarkdownOutline(this.editor?.text() ?? "")).filter((item) => item.children.length).map((item) => item.id));
       this.renderOutline(true);
+    });
+    // One listener for every row (Enter and Space on a row's button click it too).
+    this.root.querySelector(".outline-tree")!.addEventListener("click", (event) => {
+      const button = event.target instanceof Element ? event.target.closest<HTMLElement>(".outline-disclosure, .outline-heading") : null;
+      const index = Number(button?.closest<HTMLElement>(".outline-item")?.dataset.index);
+      const item = this.outlineRows[index];
+      if (!button || !item) return;
+      if (button.classList.contains("outline-heading")) {
+        this.revealOutlineItem(item);
+        return;
+      }
+      if (!this.collapsedOutline.delete(item.id)) this.collapsedOutline.add(item.id);
+      this.renderOutline(true);
+      this.root.querySelector<HTMLElement>(`.outline-item[data-index="${index}"] .outline-disclosure`)?.focus();
     });
     this.root.querySelector("#refresh")!.addEventListener("click", () => void this.refresh().catch(async (caught: unknown) => this.message("Could not refresh", ipcMessage(caught))));
     this.root.querySelector("#settings")!.addEventListener("click", () => void this.openSettings());
     this.root.querySelector("#lock")!.addEventListener("click", () => void this.lock());
+    this.root.querySelector("#open-window")!.addEventListener("click", () => void this.openInNewWindow());
+    this.root.querySelector("#elsewhere")!.addEventListener("click", () => void this.openInNewWindow());
     const picker = this.root.querySelector<HTMLButtonElement>("#workspace-picker")!;
     picker.addEventListener("click", () => this.toggleWorkspaceMenu(picker));
     this.root.querySelector(".trash-button")!.addEventListener("click", () => this.showTrash());
@@ -654,8 +944,10 @@ class App {
     const softWrap = this.root.querySelector<HTMLButtonElement>("#soft-wrap")!;
     softWrap.addEventListener("mousedown", (event) => event.preventDefault());
     softWrap.addEventListener("click", () => this.toggleSoftWrap());
+    this.applyZoom();
     this.bindFileDrop();
     window.addEventListener("keydown", this.onSoftWrapKey, true);
+    window.addEventListener("keydown", this.onViewKey, true);
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("pointerdown", this.onActivity);
     window.addEventListener("keydown", this.onActivity);
@@ -667,16 +959,37 @@ class App {
     this.applyPreviewMode();
   }
 
-  /** Shows the tree; only rows that changed are touched (tree-view.ts). */
+  /** Shows the tree and the Trash count; only rows that changed are touched (tree-view.ts). */
   private renderTree(): void {
+    if (this.drawFrame !== null) { cancelAnimationFrame(this.drawFrame); this.drawFrame = null; }
     this.treeView?.render({ selected: this.selected, expanded: this.expanded, query: this.search });
     setText(this.root.querySelector(".trash-count"), String(this.tree.trashCount()));
+    this.tree.markDrawn();
   }
 
-  /** Moves the selection in the tree: two rows change. */
+  /**
+   * Moves the selection in the tree: two rows change. After a change that
+   * was applied without drawing (Restore opens the restored document, Move
+   * to Trash of the open one opens another), the whole tree and the Trash
+   * count are drawn instead.
+   */
   private selectNode(id: string): void {
     this.selected = id;
-    this.treeView?.select(id);
+    if (this.tree.needsDraw) this.renderTree();
+    else this.treeView?.select(id);
+  }
+
+  /**
+   * A change applied without drawing, so that its caller draws once after
+   * following it, is drawn on the next frame if nothing drew it by then. An
+   * import draws on its own timer (at most twice a second).
+   */
+  private drawSoon(): void {
+    if (this.drawFrame !== null) return;
+    this.drawFrame = requestAnimationFrame(() => {
+      this.drawFrame = null;
+      if (this.tree.needsDraw && this.treeView && !this.importing) this.renderTree();
+    });
   }
 
   private activateNode(id: string): void {
@@ -730,7 +1043,8 @@ class App {
 
   /** Applies a change's tree delta. A delta that comes before the one it follows waits; if that one never comes, the session's tree is fetched (no S3 request). */
   private applyTree(delta: TreeDelta | null | undefined, render = true): void {
-    if (!isTauri || !delta) return;
+    // A document window holds no tree.
+    if (!isTauri || !delta || this.docWindow) return;
     const changed = this.tree.apply(delta);
     if (this.tree.behind && this.resyncTimer === null) {
       this.resyncTimer = window.setTimeout(() => {
@@ -739,6 +1053,7 @@ class App {
       }, 250);
     }
     if (changed && render) this.renderTree();
+    else if (changed) this.drawSoon();
   }
 
   /** Runs a change and applies its delta; after a failure the tree is fetched again (no S3 request), as part of the change may have happened. */
@@ -755,10 +1070,11 @@ class App {
 
   /** The session's own tree, without an S3 request. */
   private async resyncTree(render = true): Promise<void> {
-    if (!isTauri || !this.editor) return;
+    if (!isTauri || !this.editor || this.docWindow) return;
     try {
       this.tree.replace(await ipc.treeGet(false));
       if (render) this.renderTree();
+      else this.drawSoon();
     } catch { /* Locked meanwhile; the next unlock lists S3. */ }
   }
 
@@ -782,14 +1098,18 @@ class App {
   private showDocument(node: TreeNode, data: DocumentData): void {
     if (!this.editor) return;
     this.selectNode(node.id);
+    // Folds are per open: the outline is drawn again even for the same headings.
     this.collapsedOutline.clear();
+    this.outlineSignature = null;
     this.closeWordCount();
     this.applyingModel = true;
     try {
-      openModel(this.editor, node.id, data.text, data.readOnly, languageForFile(node.name));
+      this.editor.open(node.id, data.text, data.readOnly, languageForFile(node.name), EDITING_ELSEWHERE_HINT, data.rev);
     } finally {
       this.applyingModel = false;
     }
+    this.showElsewhere(data.readOnly);
+    this.showSoftWrap();
     this.textVersion++;
     this.previewFromTop = true;
     this.showDocumentName(node);
@@ -805,9 +1125,10 @@ class App {
     }
     this.showBreadcrumb(folders, node.name, this.tree.pathOf(node.id));
     const language = languageForFile(node.name);
-    if (this.editor) setEditorLanguage(this.editor, language);
+    this.editor?.setLanguage(language);
     setText(this.root.querySelector(".language-label"), languageLabel(language));
     this.updateOutlineAvailability();
+    if (this.focusMode) this.showWindowTitle(node.name);
   }
 
   /**
@@ -827,11 +1148,100 @@ class App {
     setAttribute(crumb, "title", path);
   }
 
+  /**
+   * Main window: whether another window writes the open document (doc_open
+   * says so), shown as the header's "Editing in another window", which
+   * brings that window to the front.
+   */
+  private showElsewhere(elsewhere: boolean): void {
+    this.openElsewhere = elsewhere && !this.docWindow;
+    const note = this.root.querySelector<HTMLElement>("#elsewhere");
+    if (note && note.hidden === this.openElsewhere) note.hidden = !this.openElsewhere;
+  }
+
+  /**
+   * "Open in new window" (header button, tree menu, Cmd/Ctrl+Shift+O): the
+   * document moves to a window of its own, in focus mode, which writes it
+   * from now on; here it stays read-only until that window closes. What was
+   * typed here reaches the outbox first, and the new window opens it from
+   * there. A document already in a window brings that window to the front.
+   */
+  private async openInNewWindow(id: string | null = this.documents.openId): Promise<void> {
+    const node = this.tree.get(id);
+    if (!node || kindName(node) !== "Document" || !this.editor || this.docWindow) return;
+    if (!isTauri) {
+      openAppWindow(documentWindowUrl(node.id));
+      return;
+    }
+    const open = this.documents.openId === node.id;
+    // Nothing typed during the hand-over is left behind: the editor is
+    // read-only from before the outbox write until the window has it.
+    const thaw = open && !this.openElsewhere ? this.editor.freeze("Opening in a new window…") : null;
+    let handedOver = false;
+    try {
+      // Every edit, also one of a document no longer open whose outbox
+      // write failed, is written first: handOff forgets what is not.
+      if (!(await this.documents.persist())) {
+        await this.message("Window not opened", "An edit could not be saved on this device. Retry, then open the document in a new window.");
+        return;
+      }
+      await ipc.openDocumentWindow(node.id);
+      handedOver = true;
+    } catch (caught) {
+      await this.message("Window not opened", ipcMessage(caught));
+      return;
+    } finally {
+      if (!handedOver) thaw?.();
+    }
+    // That window uploads the edits written here; nothing of it is retried from here.
+    this.documents.handOff(node.id);
+    if (this.documents.openId === node.id && this.editor) {
+      this.editor.setReadOnly(true, EDITING_ELSEWHERE_HINT);
+      this.showElsewhere(true);
+      await this.writerChanged(node.id);
+    }
+  }
+
+  /**
+   * Main window: a document window committed or closed (or took over) the
+   * open document. Its newest text is shown, read-only while another window
+   * writes it; Rust answers from its outbox or cache, without S3.
+   */
+  private async writerChanged(id: string): Promise<void> {
+    if (this.docWindow || this.exiting || !this.editor || this.documents.openId !== id || !this.openElsewhere) return;
+    const node = this.tree.get(id);
+    if (!node) return;
+    try {
+      await this.documents.open(id, (data) => this.showWriterText(node, data));
+    } catch {
+      /* The next open of this document shows it. */
+    }
+  }
+
+  /** The same document with another window's text: the preview keeps its place. */
+  private showWriterText(node: TreeNode, data: DocumentData): void {
+    if (!this.editor) return;
+    this.applyingModel = true;
+    try {
+      this.editor.open(node.id, data.text, data.readOnly, languageForFile(node.name), EDITING_ELSEWHERE_HINT, data.rev);
+    } finally {
+      this.applyingModel = false;
+    }
+    this.showElsewhere(data.readOnly);
+    this.showSoftWrap();
+    this.textVersion++;
+    this.renderAfterPaint();
+  }
+
   /** No document is open, for example after the open one was trashed. */
   private closeDocument(): void {
+    // Focus mode shows a document; with none open, the sidebar comes back.
+    if (this.focusMode) this.leaveFocusMode();
+    this.showElsewhere(false);
     this.documents.close();
     this.closeWordCount();
-    this.editor?.setModel(null);
+    this.editor?.close();
+    this.showSoftWrap();
     this.textVersion++;
     this.showBreadcrumb([], "", "");
     setText(this.root.querySelector(".language-label"), "");
@@ -843,10 +1253,9 @@ class App {
   // A keystroke only bumps counters: the word count is computed when asked
   // for, and the preview and outline re-render after a pause, only if shown.
   private onTextChanged(): void {
-    const model = this.editor?.getModel();
-    if (!model || !this.documents.openId || this.applyingModel) return;
-    // Read only when the edit is written to the outbox, from this document's model.
-    this.documents.edited(() => model.getValue());
+    if (!this.editor?.hasDocument || !this.documents.openId || this.applyingModel) return;
+    // Read only when the edit is written to the outbox, from this document's state.
+    this.documents.edited(this.editor.reader(), this.editor.length);
     this.textVersion++;
     if (this.wordCount) this.closeWordCount();
     if (this.previewMode === "edit" && !this.outlineShown()) return;
@@ -891,12 +1300,11 @@ class App {
     const button = this.root.querySelector<HTMLButtonElement>("#word-count");
     const editor = this.editor;
     if (!button || !editor) return;
-    const model = editor.getModel();
     const html = this.currentLanguage() === "html";
     const readable = (text: string): string => (html ? pageText(text) : text);
-    const counts = countText(model ? readable(model.getValue()) : "");
-    const rows: [string, number][] = [["Words", counts.words], ["Characters", counts.characters], ["Lines", model?.getLineCount() ?? 0]];
-    const selected = model ? (editor.getSelections() ?? []).filter((range) => !range.isEmpty()).map((range) => model.getValueInRange(range)) : [];
+    const counts = countText(readable(editor.text()));
+    const rows: [string, number][] = [["Words", counts.words], ["Characters", counts.characters], ["Lines", editor.lineCount]];
+    const selected = editor.selectedTexts();
     if (selected.length) rows.push(["Selected words", countText(readable(selected.join("\n"))).words]);
     const panel = document.createElement("section");
     panel.className = "word-count-panel";
@@ -932,7 +1340,7 @@ class App {
     const escape = (event: KeyboardEvent): void => {
       if (event.key === "Escape") this.closeWordCount();
     };
-    const selection = editor.onDidChangeCursorSelection(() => this.closeWordCount());
+    const stopWatching = editor.onSelectionChange(() => this.closeWordCount());
     window.addEventListener("pointerdown", outside, true);
     window.addEventListener("keydown", escape, true);
     window.addEventListener("blur", this.closeWordCount);
@@ -941,7 +1349,7 @@ class App {
     this.wordCount = {
       panel,
       close: () => {
-        selection.dispose();
+        stopWatching();
         window.removeEventListener("pointerdown", outside, true);
         window.removeEventListener("keydown", escape, true);
         window.removeEventListener("blur", this.closeWordCount);
@@ -990,7 +1398,7 @@ class App {
    * unless the language changed (.md and .html).
    */
   private retargetOpen(from: string, to: string): void {
-    retargetModel(from, to);
+    this.editor?.retarget(from, to);
     const swap = (key: string | null): string | null => key && key.split("|").map((part) => (part === from ? to : part)).join("|");
     this.previewKey = swap(this.previewKey);
     this.outlineKey = swap(this.outlineKey);
@@ -1008,7 +1416,12 @@ class App {
     const area = this.root.querySelector<HTMLElement>(".editor-area");
     if (!area) return;
     const outline = this.outlineShown();
-    const className = `editor-area${this.previewMode === "split" ? " split" : this.previewMode === "preview" ? " preview-only" : ""}${outline ? " outline-visible" : ""}`;
+    if (!this.focusMode && this.previewMode !== "preview") this.writingMode = this.previewMode;
+    // Focus mode keeps an open outline's class: theme.css hides the panel
+    // there without dropping its layout, so leaving focus mode does not lay
+    // out thousands of headings again (it does not re-render while hidden).
+    const outlineOpen = this.outlineVisible && this.currentLanguage() === "markdown";
+    const className = `editor-area${this.previewMode === "split" ? " split" : this.previewMode === "preview" ? " preview-only" : ""}${outlineOpen ? " outline-visible" : ""}`;
     if (area.className !== className) area.className = className;
     const toggle = this.root.querySelector<HTMLButtonElement>("#outline-toggle");
     if (toggle) {
@@ -1020,8 +1433,106 @@ class App {
       button.classList.toggle("active", active);
       setAttribute(button, "aria-pressed", String(active));
     });
-    // The outline and Split change how much room each pane can have.
-    this.resizers?.update();
+    // The outline and Split change how much room each pane can have; focus mode has no handles.
+    if (!this.focusMode) this.resizers?.update();
+    this.syncFrameWatch();
+    this.showPreviewChrome();
+  }
+
+  /**
+   * Cmd/Ctrl+=, +, - and 0 zoom what is shown, in every mode and window and
+   * wherever the focus is (in the editor they never type), but not under a
+   * dialog or without a document.
+   */
+  private zoomKeyApplies(): boolean {
+    return this.editor !== null && this.documents.openId !== null && !topModal();
+  }
+
+  /**
+   * One zoom step (or 100%) for the editor and the preview together, each
+   * shown pane keeping its reading position; saved once the keys pause. The
+   * level, the editor and a Markdown preview change in the next frame. An
+   * HTML page re-flows in the task after that frame is painted: its whole
+   * layout (about 0.5 s for a 12 MB page in WebKit) would otherwise hold
+   * back the level and the editor too. Steps that queue up behind one
+   * re-flow share the next one. The level shows for a moment, also when it
+   * is already at the end of the range.
+   */
+  private zoomContent(key: ZoomKey): void {
+    const level = zoomed(this.contentZoom, key);
+    this.showZoomLevel(level);
+    if (level === this.contentZoom) return;
+    this.zoomPlace ??= {
+      editorLine: this.previewMode === "preview" ? null : this.editor?.topLine() ?? null,
+      preview: this.previewMode === "edit" ? null : this.previewPlace(),
+    };
+    this.contentZoom = level;
+    this.applyZoom(false);
+    this.zoomFrame ??= requestAnimationFrame(() => {
+      const place = this.zoomPlace;
+      this.zoomFrame = null;
+      this.zoomPlace = null;
+      if (place?.editorLine != null) this.editor?.showLine(place.editorLine, false);
+      const preview = place?.preview ?? null;
+      if (preview && !("ratio" in preview)) this.restorePreviewPlace(preview);
+      window.setTimeout(() => {
+        this.htmlPreview.setZoom(this.contentZoom);
+        // Reading the page's height re-flows it here, in this task.
+        if (preview && "ratio" in preview) this.restorePreviewPlace(preview);
+      }, 0);
+    });
+    if (this.zoomSaveTimer !== null) clearTimeout(this.zoomSaveTimer);
+    this.zoomSaveTimer = window.setTimeout(() => {
+      this.zoomSaveTimer = null;
+      if (this.contentZoom === this.savedZoom) return;
+      const wanted = this.contentZoom;
+      if (!isTauri) {
+        this.savedZoom = wanted;
+        return;
+      }
+      void ipc.layoutSet({ preview_zoom: wanted }).then(
+        () => { this.savedZoom = wanted; },
+        () => { /* Cosmetic: the level stays for this session and the next change saves again. */ },
+      );
+    }, ZOOM_SAVE_DELAY_MS);
+  }
+
+  /**
+   * The zoom is one custom property, --content-zoom, on the two panes (not
+   * on a shared parent, so the outline's rows are not restyled): theme.css
+   * scales the editor's and the Markdown and plain-text preview's text and
+   * readable width with it. The HTML page zooms in its frame (`page`
+   * false: zoomContent zooms it after the next paint).
+   */
+  private applyZoom(page = true): void {
+    const level = this.contentZoom;
+    const value = level === ZOOM.default ? "" : String(level / 100);
+    for (const pane of this.root.querySelectorAll<HTMLElement>(".editor-area > .editor-host, .editor-area > .preview")) {
+      if (pane.style.getPropertyValue("--content-zoom") === value) continue;
+      if (value) pane.style.setProperty("--content-zoom", value);
+      else pane.style.removeProperty("--content-zoom");
+    }
+    if (page) this.htmlPreview.setZoom(level);
+    // The line height changed but the editor's box did not: CodeMirror measures its lines again.
+    this.editor?.view.requestMeasure();
+  }
+
+  /**
+   * The level ("110%") centred near the top of the content for a second,
+   * then fading out (theme.css .zoom-indicator); a polite live region, so
+   * screen readers say it too.
+   */
+  private showZoomLevel(level: number): void {
+    const note = this.root.querySelector<HTMLElement>(".zoom-indicator");
+    const label = note?.querySelector<HTMLElement>(".zoom-indicator-level");
+    if (!note || !label) return;
+    label.textContent = `${level}%`;
+    note.classList.add("shown");
+    if (this.zoomNoteTimer !== null) clearTimeout(this.zoomNoteTimer);
+    this.zoomNoteTimer = window.setTimeout(() => {
+      this.zoomNoteTimer = null;
+      note.classList.remove("shown");
+    }, ZOOM_NOTE_MS);
   }
 
   /**
@@ -1030,7 +1541,8 @@ class App {
    */
   private saveLayout(layout: PanelLayout): void {
     this.panelLayout = layout;
-    if (isTauri) void ipc.layoutSet(layoutToWire(layout)).catch(() => {
+    // A document window has no panes of its own to size.
+    if (isTauri && !this.docWindow) void ipc.layoutSet(layoutToWire(layout)).catch(() => {
       /* Cosmetic: the sizes stay for this session and the next drag saves again. */
     });
   }
@@ -1038,46 +1550,64 @@ class App {
   /** Soft wrap for every document this session (Alt+Z, Option+Z on macOS, or the status bar). */
   private toggleSoftWrap(): void {
     if (!this.editor) return;
-    setSoftWrap(this.editor, !softWrapEnabled());
+    this.editor.setSoftWrap(!softWrapEnabled());
     this.showSoftWrap();
   }
 
+  /** The status-bar toggle; a document with a line too long to wrap shows it off and says why. */
   private showSoftWrap(): void {
     const button = this.root.querySelector<HTMLButtonElement>("#soft-wrap");
     if (!button) return;
-    setAttribute(button, "aria-pressed", String(softWrapEnabled()));
-    setAttribute(button, "title", `Word wrap ${softWrapEnabled() ? "on" : "off"} (${isMac ? "⌥Z" : "Alt+Z"})`);
+    const keys = isMac ? "⌥Z" : "Alt+Z";
+    const unwrapped = this.editor?.longLines ?? false;
+    setAttribute(button, "aria-pressed", String(softWrapEnabled() && !unwrapped));
+    setAttribute(button, "title", unwrapped ? `Word wrap is off for this document: a line is too long to wrap (${keys})` : `Word wrap ${softWrapEnabled() ? "on" : "off"} (${keys})`);
   }
 
   /**
    * Alt+Z (Option+Z on macOS) toggles soft wrap, as in VS Code. It is caught
-   * in the capture phase, ahead of Monaco, so the editor never types "Ω";
+   * in the capture phase, ahead of the editor, so it never types "Ω";
    * other text fields and dialogs keep the key for their own characters.
    * keyCode, not code, on purpose: it follows the keyboard layout, so the
    * shortcut is the key printed Z (physical Y on QWERTZ), as in VS Code.
    */
   private onSoftWrapKey = (event: KeyboardEvent): void => {
     if (event.keyCode !== 90 || !event.altKey || event.metaKey || event.ctrlKey || event.shiftKey || event.isComposing) return;
-    const inEditor = event.target instanceof Element && event.target.closest(".monaco-editor") !== null;
+    const inEditor = event.target instanceof Element && event.target.closest(".cm-editor") !== null;
     if (!inEditor && isTypingTarget(event.target)) return;
     event.preventDefault();
     event.stopPropagation();
     if (!event.repeat) this.toggleSoftWrap();
   };
 
-  /** Showing or hiding the outline never re-renders the preview. */
+  /** Showing or hiding the outline never re-renders the preview; a hidden outline keeps no rows. */
   private toggleOutline(): void {
     if (this.currentLanguage() !== "markdown") return;
     this.outlineVisible = !this.outlineVisible;
+    if (!this.outlineVisible) this.clearOutline();
     this.applyLayout();
     this.renderOutline();
   }
 
+  private clearOutline(): void {
+    this.outlineObserver?.disconnect();
+    const tree = this.root.querySelector(".outline-tree");
+    tree?.replaceChildren();
+    // Shown again, it starts at the top (its rows are drawn from there).
+    if (tree) tree.scrollTop = 0;
+    this.outlineKey = this.outlineSignature = null;
+    this.outlineRows = [];
+    this.outlineDrawn = 0;
+  }
+
   private outlineShown(): boolean {
-    return this.outlineVisible && this.currentLanguage() === "markdown";
+    return !this.focusMode && this.outlineVisible && this.currentLanguage() === "markdown";
   }
 
   private updateOutlineAvailability(): void {
+    // "Open in new window" needs an open document too.
+    const newWindow = this.root.querySelector<HTMLButtonElement>("#open-window");
+    if (newWindow && newWindow.disabled === Boolean(this.documents.openId)) newWindow.disabled = !this.documents.openId;
     const toggle = this.root.querySelector<HTMLButtonElement>("#outline-toggle");
     if (!toggle) return;
     const available = this.currentLanguage() === "markdown";
@@ -1087,83 +1617,291 @@ class App {
   }
 
   /**
-   * Builds a nested, independently collapsible heading tree for Markdown,
-   * only while the outline is shown and only when the text changed (or
-   * `force`, after a fold). A hidden outline keeps its DOM.
+   * Shows the independently collapsible heading tree of Markdown, only while
+   * the outline is shown and only when the headings changed (or `force`,
+   * after a fold). Rows are drawn OUTLINE_CHUNK at a time as the outline
+   * scrolls; a redraw of the same document keeps at least the rows drawn.
    */
   private renderOutline(force = false): void {
     const tree = this.root.querySelector<HTMLElement>(".outline-tree");
     if (!tree || !this.editor || !this.outlineShown()) return;
-    const key = `${this.documents.openId}|${this.textVersion}`;
+    const id = this.documents.openId;
+    const key = `${id}|${this.textVersion}`;
     if (!force && key === this.outlineKey) return;
     this.outlineKey = key;
-    const headings = parseMarkdownOutline(this.editor.getValue());
+    const headings = parseMarkdownOutline(this.editor.text());
+    const signature = `${id}\n${flattenOutline(headings).map((item) => `${item.level}\t${item.line}\t${item.text}`).join("\n")}`;
+    if (!force && signature === this.outlineSignature && tree.firstChild) return;
+    const sameDocument = this.outlineSignature?.startsWith(`${id}\n`) ?? false;
+    this.outlineSignature = signature;
+    this.outlineObserver?.disconnect();
     if (!headings.length) {
       const empty = document.createElement("p");
       empty.className = "outline-empty";
       empty.textContent = "Add a Markdown heading to build the outline.";
       tree.replaceChildren(empty);
+      this.outlineRows = [];
+      this.outlineDrawn = 0;
       return;
     }
-    const append = (items: OutlineItem[], parent: ParentNode): void => {
-      for (const item of items) {
-        const branch = document.createElement("div");
-        branch.className = "outline-item";
-        branch.setAttribute("role", "treeitem");
-        branch.setAttribute("aria-level", String(item.level));
-        const row = document.createElement("div");
-        row.className = "outline-row";
-        row.style.setProperty("--outline-depth", String(Math.max(0, item.level - 1)));
-        if (item.children.length) {
-          const disclosure = document.createElement("button");
-          const collapsed = this.collapsedOutline.has(item.id);
-          disclosure.type = "button";
-          disclosure.className = `outline-disclosure${collapsed ? "" : " open"}`;
-          disclosure.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} ${item.text}`);
-          disclosure.append(icon("chevron"));
-          disclosure.addEventListener("click", () => {
-            collapsed ? this.collapsedOutline.delete(item.id) : this.collapsedOutline.add(item.id);
-            this.renderOutline(true);
-          });
-          row.append(disclosure);
-          branch.setAttribute("aria-expanded", String(!collapsed));
-        } else {
-          const spacer = document.createElement("span");
-          spacer.className = "outline-disclosure-spacer";
-          row.append(spacer);
-        }
-        const heading = document.createElement("button");
-        heading.type = "button";
-        heading.className = "outline-heading";
-        heading.textContent = item.text;
-        heading.title = `${item.text} · line ${item.line}`;
-        heading.addEventListener("click", () => this.revealOutlineItem(item));
-        row.append(heading);
-        branch.append(row);
-        if (item.children.length && !this.collapsedOutline.has(item.id)) {
-          const children = document.createElement("div");
-          children.className = "outline-children";
-          children.setAttribute("role", "group");
-          append(item.children, children);
-          branch.append(children);
-        }
-        parent.append(branch);
-      }
-    };
-    const fragment = document.createDocumentFragment();
-    append(headings, fragment);
-    tree.replaceChildren(fragment);
+    const drawn = sameDocument ? this.outlineDrawn : 0;
+    this.outlineRows = flattenOutline(headings, this.collapsedOutline);
+    this.outlineDrawn = 0;
+    tree.replaceChildren();
+    this.drawOutlineRows(tree, Math.max(OUTLINE_CHUNK, drawn));
   }
 
+  /** Appends up to `count` more outline rows, and a marker that draws the next ones once it nears the view. */
+  private drawOutlineRows(tree: HTMLElement, count = OUTLINE_CHUNK): void {
+    tree.querySelector(".outline-more")?.remove();
+    const end = Math.min(this.outlineRows.length, this.outlineDrawn + count);
+    const fragment = document.createDocumentFragment();
+    const chevron = icon("chevron");
+    for (let index = this.outlineDrawn; index < end; index++) {
+      const item = this.outlineRows[index]!;
+      const branch = document.createElement("div");
+      branch.className = "outline-item";
+      branch.dataset.index = String(index);
+      branch.setAttribute("role", "treeitem");
+      branch.setAttribute("aria-level", String(item.level));
+      const row = document.createElement("div");
+      row.className = "outline-row";
+      row.style.setProperty("--outline-depth", String(Math.max(0, item.level - 1)));
+      if (item.children.length) {
+        const collapsed = this.collapsedOutline.has(item.id);
+        const disclosure = document.createElement("button");
+        disclosure.type = "button";
+        disclosure.className = `outline-disclosure${collapsed ? "" : " open"}`;
+        disclosure.setAttribute("aria-label", `${collapsed ? "Expand" : "Collapse"} ${item.text}`);
+        disclosure.append(chevron.cloneNode(true));
+        row.append(disclosure);
+        branch.setAttribute("aria-expanded", String(!collapsed));
+      } else {
+        const spacer = document.createElement("span");
+        spacer.className = "outline-disclosure-spacer";
+        row.append(spacer);
+      }
+      const heading = document.createElement("button");
+      heading.type = "button";
+      heading.className = "outline-heading";
+      heading.textContent = item.text;
+      heading.title = `${item.text} · line ${item.line}`;
+      row.append(heading);
+      branch.append(row);
+      fragment.append(branch);
+    }
+    this.outlineDrawn = end;
+    if (end < this.outlineRows.length) {
+      const more = document.createElement("div");
+      more.className = "outline-more";
+      more.setAttribute("aria-hidden", "true");
+      fragment.append(more);
+      // A new one after renderMain, which makes a new outline.
+      if (this.outlineObserver?.root !== tree) {
+        this.outlineObserver?.disconnect();
+        this.outlineObserver = new IntersectionObserver((entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) this.drawOutlineRows(tree);
+        }, { root: tree, rootMargin: "0px 0px 600px 0px" });
+      }
+      this.outlineObserver.disconnect();
+      this.outlineObserver.observe(more);
+    }
+    tree.append(fragment);
+  }
+
+  /**
+   * An outline heading (clicked, or Enter / Space on it) in the panes
+   * shown: Edit goes to its line, Preview scrolls the preview to it, Split
+   * does both. Preview keeps the focus in the outline, so the keyboard can
+   * go on from there; the editor takes it when shown, as before.
+   */
   private revealOutlineItem(item: OutlineItem): void {
     if (!this.editor) return;
-    if (this.previewMode === "preview") {
-      this.previewMode = "split";
-      this.applyPreviewMode();
-    }
-    this.editor.setPosition({ lineNumber: item.line, column: 1 });
-    this.editor.revealLineInCenter(item.line);
+    if (this.previewMode !== "edit") this.scrollPreviewToHeading(item);
+    if (this.previewMode === "preview") return;
+    this.showHeadingLine(item.line);
     this.editor.focus();
+  }
+
+  private showHeadingLine(line: number): void {
+    this.editor?.revealLine(line);
+  }
+
+  /** The preview's heading of `item` at the preview's top; without it (HTML, a stale or paused preview) the mapped line. */
+  private scrollPreviewToHeading(item: OutlineItem): void {
+    const host = this.root.querySelector<HTMLElement>(".preview");
+    if (!host) return;
+    const heading = host.classList.contains("html-mode") ? null : this.previewHeadingFor(host, item);
+    if (heading) scrollPaneTo(host, heading);
+    else this.showPreviewLine(item.line);
+  }
+
+  /**
+   * The preview element of outline item `item`: the heading at the same
+   * index when the preview's headings are the outline's (previewHeadings),
+   * else the one with the id its text gets (preview.rs numbers repeats the
+   * same way).
+   */
+  private previewHeadingFor(host: HTMLElement, item: OutlineItem): Element | null {
+    const headings = this.previewHeadings(host);
+    const index = this.headingLines().indexOf(item.line);
+    if (headings && index >= 0) return headings[index] ?? null;
+    const ids = new HeadingIds();
+    for (const other of flattenOutline(parseMarkdownOutline(this.editor?.text() ?? ""))) {
+      const id = ids.next(other.text);
+      if (other.line === item.line) return previewTarget(host, id);
+    }
+    return null;
+  }
+
+  /** The source line of the preview's heading `target`, when the preview's headings are the outline's. */
+  private previewHeadingLine(host: HTMLElement, target: Element): number | null {
+    const index = this.previewHeadings(host)?.indexOf(target) ?? -1;
+    return index >= 0 ? this.headingLines()[index] ?? null : null;
+  }
+
+  /**
+   * The preview's headings in source order when they are exactly the
+   * outline's (outline.ts skips fenced code, as the renderer does): the
+   * top-level ones, else all but those in block quotes, which the outline
+   * never counts (it does count a heading in a list item); null when
+   * neither count matches.
+   */
+  private previewHeadings(host: HTMLElement): Element[] | null {
+    const count = this.headingLines().length;
+    const top = Array.from(host.querySelectorAll(PREVIEW_HEADINGS));
+    if (top.length === count) return top;
+    const unquoted = Array.from(host.querySelectorAll(ALL_HEADINGS)).filter((heading) => !heading.closest("blockquote"));
+    return unquoted.length === count ? unquoted : null;
+  }
+
+  /** The source line of the heading `fragment` names, by the ids the outline's headings get. */
+  private headingLineFor(fragment: string): number | null {
+    const wanted = fragmentIds(fragment);
+    const ids = new HeadingIds();
+    for (const item of flattenOutline(parseMarkdownOutline(this.editor?.text() ?? ""))) {
+      if (wanted.includes(ids.next(item.text))) return item.line;
+    }
+    return null;
+  }
+
+  /**
+   * A vault link of the Markdown preview (`nb-doc:` / `nb-wiki:`, through
+   * navigation.ts). The main window resolves it from the open document's
+   * folder; a document window shows a heading of its own document itself
+   * and hands every other link to the main window, which comes to the front.
+   */
+  private followVaultLink(href: string): void {
+    const link = parseInternalHref(href);
+    const open = this.documents.openId;
+    if (!link || !open || !this.editor) return;
+    if (this.docWindow) void this.followFromDocumentWindow(href, link, open);
+    else void this.openVaultLink(link, this.tree.pathOf(open));
+  }
+
+  private async followFromDocumentWindow(href: string, link: InternalLink, id: string): Promise<void> {
+    let path = this.docWindowPath;
+    if (isTauri) {
+      try {
+        // A rename or move changed the folder links start from: Rust knows where it is now.
+        path = (await ipc.documentWindowInfo()).path;
+      } catch {
+        return;
+      }
+    }
+    const own = resolveInternalLink(pathIndex(path, id), path, link);
+    if (own.kind === "document" && own.id === id) {
+      if (link.fragment) this.revealFragment(link.fragment);
+      return;
+    }
+    if (!isTauri) {
+      documentLinks()?.postMessage({ from: path, href } satisfies DocumentLink);
+      return;
+    }
+    try {
+      await ipc.documentLinkOpen(href);
+    } catch (caught) {
+      await this.message("Link not opened", safeErrorMessage(caught, "The main window could not open this link."));
+    }
+  }
+
+  /** Main window: a document window's link (Rust says which document's folder it starts from). */
+  private openLinkFromWindow(payload: DocumentLink | null | undefined): void {
+    if (this.docWindow || typeof payload?.from !== "string" || typeof payload.href !== "string") return;
+    const link = parseInternalHref(payload.href);
+    if (link) void this.openVaultLink(link, payload.from);
+  }
+
+  /**
+   * What `link` names from the document at `from`, checked against the
+   * tree: a document opens (at its heading), a folder is shown in the
+   * sidebar, and anything else is said in a short message.
+   */
+  private async openVaultLink(link: InternalLink, from: string): Promise<void> {
+    if (this.screen !== "main" || !this.editor || this.docWindow) return;
+    const target = resolveInternalLink(new VaultIndex(ROOT, this.vaultEntries()), from, link);
+    const name = link.target.length > 80 ? `${link.target.slice(0, 79)}…` : link.target;
+    switch (target.kind) {
+      case "missing":
+        await this.message("Link not found", `“${name}” is not in this workspace.`);
+        return;
+      case "ambiguous":
+        await this.message("Link is ambiguous", `${target.count} documents are named “${name}”. Add a folder to the link, like [[Folder/${name}]].`);
+        return;
+      case "folder":
+        // The sidebar shows the folder: focus mode hides it.
+        if (this.focusMode) this.leaveFocusMode();
+        this.revealInTree(target.id);
+        return;
+      case "document":
+        if (target.id !== this.documents.openId) {
+          await this.openDocument(target.id);
+          if (this.documents.openId !== target.id) return;
+        }
+        if (link.fragment) this.revealFragment(link.fragment);
+    }
+  }
+
+  private *vaultEntries(): Iterable<VaultEntry> {
+    for (const node of this.tree.nodes()) {
+      const kind = kindName(node);
+      if (kind === "Folder" || kind === "Document") yield { id: node.id, parent: node.parent, name: node.name, folder: kind === "Folder" };
+    }
+  }
+
+  /**
+   * The heading `fragment` names in the open document, in the panes shown:
+   * the preview once it shows the current text (and Split's editor at the
+   * heading's line), or Edit's editor at once.
+   */
+  private revealFragment(fragment: string): void {
+    const id = this.documents.openId;
+    if (!id || !this.editor) return;
+    if (this.previewMode === "edit") {
+      const line = this.headingLineFor(fragment);
+      if (line !== null) this.showHeadingLine(line);
+      return;
+    }
+    this.pendingFragment = { id, fragment };
+    if (this.previewDoc === id && this.previewInFlight === null && this.previewKey === `${id}|${this.textVersion}|${this.currentLanguage()}`) {
+      this.applyPendingFragment();
+    }
+  }
+
+  /** After a render: the pending heading, if the preview shows its document. */
+  private applyPendingFragment(): void {
+    const pending = this.pendingFragment;
+    this.pendingFragment = null;
+    const host = this.root.querySelector<HTMLElement>(".preview");
+    if (!pending || !host || pending.id !== this.documents.openId || this.previewMode === "edit") return;
+    const target = previewTarget(host, pending.fragment);
+    if (target) {
+      focusPaneTarget(host, target);
+      scrollPaneTo(host, target);
+    }
+    if (this.previewMode !== "split") return;
+    const line = (target ? this.previewHeadingLine(host, target) : null) ?? this.headingLineFor(pending.fragment);
+    if (line !== null) this.showHeadingLine(line);
   }
 
   private currentLanguage(): DocumentLanguage {
@@ -1175,39 +1913,38 @@ class App {
    * Renders the open document into the preview pane, only when the pane is
    * shown and the document, its text or its language changed since the last
    * render. Edit mode keeps the hidden DOM, so switching back is free.
-   * Documents over LARGE_PREVIEW_CHARS render only on `force` (the Render
-   * button). Responses are applied only if no newer render, document switch
-   * or lock happened while Rust was rendering.
+   * Documents over LARGE_PREVIEW_CHARS render once per text in Preview (and
+   * so in focus mode and document windows); Split, which re-renders while
+   * typing, waits for `force` (the Render button, pausePreview). Responses
+   * are applied only if no newer render, document switch or lock happened
+   * while Rust was rendering.
    */
   private async renderPreview(force = false): Promise<void> {
     const host = this.root.querySelector<HTMLElement>(".preview");
     if (!host) return;
     const id = this.documents.openId;
-    const model = this.editor?.getModel();
-    if (!this.editor || !id || !model) {
+    if (!this.editor?.hasDocument || !id) {
       this.clearPreview(host);
       return;
     }
     const language = this.currentLanguage();
-    const large = model.getValueLength() > LARGE_PREVIEW_CHARS;
+    const large = this.editor.length > LARGE_PREVIEW_CHARS;
     if (this.previewMode === "edit") {
       // Large documents do not keep a hidden copy of their preview.
       if (large) this.clearPreview(host);
       return;
     }
-    const key = large ? `large|${id}|${language}` : `${id}|${this.textVersion}|${language}`;
+    const key = `${id}|${this.textVersion}|${language}`;
+    if (large && !force && this.previewMode === "split") {
+      this.pausePreview(host, id, language, key);
+      return;
+    }
     if (!force && key === this.previewKey) return;
     this.previewKey = key;
     const sequence = ++this.previewSeq;
     const fromTop = this.previewFromTop;
     this.previewFromTop = false;
-    if (large && !force) {
-      this.previewDoc = null;
-      host.classList.remove("html-mode");
-      host.replaceChildren(this.largePreviewNote());
-      return;
-    }
-    const text = this.editor.getValue();
+    const text = this.editor.text();
     if (tooLargeToPreview(text)) {
       this.previewDoc = null;
       host.classList.remove("html-mode");
@@ -1218,9 +1955,9 @@ class App {
     if (language === "html") {
       this.previewDoc = null;
       this.htmlPreview.render(host, id, text);
-      const note = this.largePreviewNote();
-      if (!large) note.remove();
-      else if (host.firstChild !== note) host.prepend(note);
+      // Rendered: a Render button left above the page from Split goes.
+      this.pausedNote?.remove();
+      this.showPreviewChrome();
       return;
     }
     if (language === "plaintext") {
@@ -1228,19 +1965,22 @@ class App {
       const pre = document.createElement("pre");
       pre.className = "plain-preview";
       pre.textContent = text;
-      host.replaceChildren(...(large ? [this.largePreviewNote(), pre] : [pre]));
+      host.replaceChildren(pre);
       if (fromTop) host.scrollTop = 0;
+      this.showPreviewChrome();
       return;
     }
     let blocks: DocumentFragment;
+    this.previewInFlight = sequence;
     try {
       blocks = previewFragment(isTauri ? await ipc.previewRender(text) : renderMarkdown(text));
     } catch (caught) {
       blocks = document.createDocumentFragment();
       blocks.append(previewNote(safeErrorMessage(caught, "The preview could not be rendered.")));
+    } finally {
+      if (this.previewInFlight === sequence) this.previewInFlight = null;
     }
     if (sequence !== this.previewSeq || !host.isConnected) return;
-    if (large) blocks.prepend(this.largePreviewNote());
     // Same document: replace only the changed blocks. Otherwise everything.
     if (!large && this.previewDoc === id) patchChildren(host, blocks);
     else {
@@ -1248,6 +1988,35 @@ class App {
       if (fromTop) host.scrollTop = 0;
     }
     this.previewDoc = large ? null : id;
+    this.showPreviewChrome();
+    this.applyPreviewLine();
+    if (this.pendingFragment) this.applyPendingFragment();
+    // Typed in Split while Rust rendered: this render is already behind.
+    if (large && this.previewMode === "split" && key !== `${id}|${this.textVersion}|${language}`) {
+      this.pausePreview(host, id, language, `${id}|${this.textVersion}|${language}`);
+    }
+  }
+
+  /**
+   * Split with a large document whose text is not rendered: "Preview paused"
+   * and its Render button, above this document's last render (kept, so the
+   * reading position stays) or alone. A keystroke costs one comparison.
+   */
+  private pausePreview(host: HTMLElement, id: string, language: DocumentLanguage, key: string): void {
+    if (key === this.previewKey) return;
+    const note = this.largePreviewNote();
+    const shown = this.previewKey?.startsWith(`${id}|`) && this.previewKey.endsWith(`|${language}`);
+    if (!shown) {
+      if (host.firstChild === note && host.childNodes.length === 1) return;
+      this.previewSeq++;
+      this.previewKey = this.previewDoc = null;
+      host.classList.remove("html-mode");
+      host.replaceChildren(note);
+      this.showPreviewChrome();
+      return;
+    }
+    if (host.firstChild !== note) host.prepend(note);
+    this.showPreviewChrome();
   }
 
   private clearPreview(host: HTMLElement): void {
@@ -1257,6 +2026,21 @@ class App {
     this.htmlPreview.reset();
     host.classList.remove("html-mode");
     host.replaceChildren();
+  }
+
+  /**
+   * The status bar's "Scripts off (N)" while the HTML page preview shown
+   * removed scripts: not in focus mode or a document window, which hide the
+   * status bar (the preview pane never carries that note).
+   */
+  private showPreviewChrome(): void {
+    const item = this.root.querySelector<HTMLElement>("#scripts-off");
+    if (!item) return;
+    const count = this.focusMode || this.previewMode === "edit" ? 0 : this.htmlPreview.scriptsOff;
+    if (item.hidden !== (count === 0)) item.hidden = count === 0;
+    if (count === 0) return;
+    setText(item, `Scripts off (${count})`);
+    setAttribute(item, "title", `This page has ${count} ${count === 1 ? "script" : "scripts"}. The preview shows HTML pages without running scripts, so anything a script would build is missing.`);
   }
 
   /** "Preview paused" with a Render button, above a large document's preview. */
@@ -1284,6 +2068,8 @@ class App {
     this.previewSeq++;
     this.previewKey = this.previewDoc = this.outlineKey = null;
     this.pausedNote = null;
+    this.previewLineWanted = this.previewInFlight = null;
+    this.pendingFragment = null;
   }
 
   /**
@@ -1594,8 +2380,22 @@ class App {
    */
   private async saveBeforeClosing(title: string, retry: string): Promise<(() => void) | null> {
     if (!this.editor) return () => {};
+    // Document windows save and close first (each as its close button
+    // does); one that cannot save keeps the workspace open.
+    this.exiting = true;
+    if (!(await this.closeDocumentWindows(title))) {
+      this.exiting = false;
+      return null;
+    }
     this.documents.invalidate();
-    const thaw = freezeEditor(this.editor);
+    const frozen = this.editor.freeze();
+    const thaw = (): void => {
+      frozen();
+      this.exiting = false;
+      // A document a closed window wrote is writable here again.
+      const open = this.documents.openId;
+      if (open && this.openElsewhere) void this.writerChanged(open);
+    };
     const failed = async (): Promise<null> => {
       thaw();
       await this.message(title, `The open document could not be saved on this device. Retry, then ${retry}.`);
@@ -1606,6 +2406,22 @@ class App {
     // Anything typed before the editor froze reaches the outbox before the session ends.
     if (!(await this.documents.persist())) return failed();
     return thaw;
+  }
+
+  /**
+   * Main window: every document window saves and closes (lock, switch,
+   * phrase change, quit). False, after a message, when one stays open
+   * because its edit could not be written even to the outbox.
+   */
+  private async closeDocumentWindows(title: string): Promise<boolean> {
+    if (!isTauri || this.docWindow) return true;
+    try {
+      await ipc.documentWindowsClose();
+      return true;
+    } catch (caught) {
+      await this.message(title, ipcMessage(caught));
+      return false;
+    }
   }
 
   /** Asks whether to go on although edits of `workspace` are not uploaded yet. */
@@ -1879,6 +2695,8 @@ class App {
     submit.textContent = "Migrating…";
     try {
       if (!(await this.documents.save())) throw new Error("Save the open document before changing the phrase.");
+      // Every key changes: document windows save and close first.
+      if (isTauri) await ipc.documentWindowsClose();
       const result = await ipc.passphraseChange(oldPhrase, newPhrase);
       form.reset();
       overlay.remove();
@@ -1907,8 +2725,11 @@ class App {
         { label: "New folder", run: () => void this.createFolder() },
       );
     }
+    if (kindName(node) === "Document") {
+      actions.push({ label: "Open in new window", shortcut: NEW_WINDOW_KEYS, run: () => void this.openInNewWindow(node.id) });
+    }
     actions.push(
-      { label: "Rename…", run: () => void this.renameNode(node) },
+      { label: "Rename…", run: () => void this.renameNode(node), separatorBefore: kindName(node) === "Document" },
       { label: "Move to Trash", danger: true, run: () => void this.trashNode(node) },
     );
     this.contextMenu.show(x, y, actions);
@@ -1941,15 +2762,33 @@ class App {
     if (!(await this.confirm("Move to Trash?", `“${node.name}” will stay encrypted and can be restored later.`, "Move to Trash"))) return;
     await this.relocate(node, "Could not move item", async () => {
       if (isTauri) return { id: null, tree: (await ipc.nodeTrash(node.id)).tree };
-      const gone: string[] = [];
-      const collect = (id: string): void => {
-        gone.push(id);
-        for (const child of this.tree.children(id)) collect(child.id);
-      };
-      collect(node.id);
-      this.tree.change([], gone);
+      this.trashLocally(node);
       return { id: null };
     });
+  }
+
+  /** Browser mode: Move to Trash keeps the nodes for Restore and lists a Trash entry, as Rust does. */
+  private trashLocally(node: TreeNode): void {
+    const gone: TreeNode[] = [];
+    const collect = (item: TreeNode): void => {
+      gone.push(item);
+      for (const child of this.tree.children(item.id)) collect(child);
+    };
+    collect(node);
+    const key = `local:${crypto.randomUUID()}`;
+    const isFolder = kindName(node) === "Folder";
+    const documents = gone.filter((item) => kindName(item) === "Document").length;
+    const path = this.tree.pathOf(node.id).slice(1);
+    const entry: TreeNode = {
+      id: `trash-${key}`, parent: TRASH, name: node.name, kind: "TrashEntry", trash_entry_id: key,
+      origin: {
+        name: node.name, original_path: path, location: path.split("/").slice(0, -1).join("/"), deleted_at: Date.now(),
+        item_kind: isFolder ? "Folder" : "Document", item_count: gone.length - 1, doc_count: documents,
+        folder_count: gone.length - documents - (isFolder ? 1 : 0), image_count: 0, legacy: false,
+      },
+    };
+    this.localTrash.set(key, gone);
+    this.tree.change([entry], gone.map((item) => item.id));
   }
 
   private affectsOpenDocument(node: TreeNode): boolean {
@@ -2088,11 +2927,14 @@ class App {
    */
   private leaveWorkspace(): void {
     this.nextAuth();
+    this.exiting = false;
+    this.openElsewhere = false;
+    // No file name stays in the window title once the workspace is locked.
+    this.endFocusState();
     this.cancelPreview();
     this.htmlPreview.reset();
     this.documents.reset();
-    disposeModels(this.editor ?? undefined);
-    this.editor?.dispose();
+    this.editor?.destroy();
     this.editor = null;
     this.selected = "";
     this.search = "";
@@ -2100,13 +2942,17 @@ class App {
     this.treeView = null;
     if (this.resyncTimer !== null) window.clearTimeout(this.resyncTimer);
     this.resyncTimer = null;
+    if (this.drawFrame !== null) cancelAnimationFrame(this.drawFrame);
+    this.drawFrame = null;
     this.docs.clear();
+    this.localTrash.clear();
     this.contextMenu.close();
     this.closeWordCount();
     this.resizers?.dispose();
     this.resizers = null;
     document.querySelectorAll(".modal-overlay").forEach((overlay) => overlay.remove());
     window.removeEventListener("keydown", this.onSoftWrapKey, true);
+    window.removeEventListener("keydown", this.onViewKey, true);
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("pointerdown", this.onActivity);
     window.removeEventListener("keydown", this.onActivity);
@@ -2137,6 +2983,18 @@ class App {
   private async beforeClose(): Promise<void> {
     // A pane size changed by keys in the last 500 ms is saved too.
     this.resizers?.flush();
+    // Quitting closes the document windows too, each saving first.
+    if (isTauri && !this.docWindow) {
+      this.exiting = true;
+      try {
+        await ipc.documentWindowsClose();
+      } catch (caught) {
+        this.exiting = false;
+        try { await ipc.cancelClose(); } catch { /* A later close can retry. */ }
+        await this.message("Window kept open", ipcMessage(caught));
+        return;
+      }
+    }
     if (await this.documents.flushForExit()) {
       try { await ipc.closeAfterFlush(); } catch { /* Rust closes the window after a timeout. */ }
       return;
@@ -2176,13 +3034,18 @@ class App {
   // Like Notebook, an occupied original path is never overwritten or renamed
   // silently: the user picks another folder or name instead.
   private async restoreTrash(entry: TreeNode, overlay: HTMLElement): Promise<void> {
-    if (!isTauri) { overlay.remove(); return; }
+    if (!isTauri) {
+      overlay.remove();
+      await this.afterRestore(entry, this.restoreLocally(entry));
+      return;
+    }
     try {
       const result = await ipc.trashRestore(trashEntryId(entry), "Original");
       overlay.remove();
       await this.afterRestore(entry, result);
     } catch (error) {
-      if (errorCode(error) !== "RESTORE_CONFLICT") { await this.message("Restore failed", ipcMessage(error)); return; }
+      // A failed restore may have copied or deleted part of the entry: take the session's tree again.
+      if (errorCode(error) !== "RESTORE_CONFLICT") { await this.resyncTree(); await this.message("Restore failed", ipcMessage(error)); return; }
       const elsewhere = await this.confirm("Original location is taken", safeErrorMessage(error, "Something already exists at the original location."), "Restore to…", { danger: false });
       if (!elsewhere) return;
       overlay.remove();
@@ -2199,6 +3062,7 @@ class App {
     try {
       await this.afterRestore(entry, await ipc.trashRestore(trashEntryId(entry), { To: choice.folder }, choice.name));
     } catch (error) {
+      if (errorCode(error) !== "RESTORE_CONFLICT") await this.resyncTree();
       await this.message("Restore failed", ipcMessage(error));
     }
   }
@@ -2232,6 +3096,21 @@ class App {
     });
   }
 
+  /** Browser mode: the item goes back to its folder (the root if that is gone), under a free name. */
+  private restoreLocally(entry: TreeNode): RestoreResult {
+    const key = trashEntryId(entry);
+    const [item, ...inside] = this.localTrash.get(key) ?? [];
+    this.localTrash.delete(key);
+    if (!item) {
+      this.tree.change([], [entry.id]);
+      return { restored_id: "", final_name: entry.name, final_path: entry.name };
+    }
+    const parent = item.parent && this.tree.has(item.parent) ? item.parent : ROOT;
+    const restored = { ...item, parent, name: uniqueName(this.tree.children(parent), item.name) };
+    this.tree.change([restored, ...inside], [entry.id]);
+    return { restored_id: restored.id, final_name: restored.name, final_path: this.tree.pathOf(restored.id).slice(1) };
+  }
+
   private async afterRestore(entry: TreeNode, result: RestoreResult): Promise<void> {
     this.applyTree(result.tree, false);
     const restored = this.tree.get(result.restored_id);
@@ -2244,16 +3123,37 @@ class App {
 
   private async purgeTrash(entry: TreeNode, overlay: HTMLElement): Promise<void> {
     if (!(await this.confirm("Delete permanently?", `“${entry.name}” will be removed from S3 for this app and Notebook. This cannot be undone.`, "Delete permanently"))) return;
-    try {
-      if (isTauri) this.applyTree((await ipc.trashPurge([trashEntryId(entry)])).tree);
-      overlay.remove(); this.renderTree(); this.showTrash();
-    } catch (error) { await this.message("Delete failed", ipcMessage(error)); }
+    await this.deleteFromTrash(overlay, "Delete failed", () => isTauri ? ipc.trashPurge([trashEntryId(entry)]) : this.purgeLocally([entry]), true);
   }
 
   private async emptyTrash(overlay: HTMLElement): Promise<void> {
     if (!(await this.confirm("Empty Trash?", "Every item in Trash, including items deleted in Notebook, will be permanently removed from S3.", "Empty Trash"))) return;
-    try { if (isTauri) this.applyTree((await ipc.trashEmpty()).tree); overlay.remove(); this.renderTree(); }
-    catch (error) { await this.message("Empty Trash failed", ipcMessage(error)); }
+    await this.deleteFromTrash(overlay, "Empty Trash failed", () => isTauri ? ipc.trashEmpty() : this.purgeLocally(this.tree.trash()), false);
+  }
+
+  /** Browser mode: Delete permanently and Empty Trash. */
+  private async purgeLocally(entries: TreeNode[]): Promise<{ tree?: TreeDelta | null }> {
+    for (const entry of entries) this.localTrash.delete(trashEntryId(entry));
+    this.tree.change([], entries.map((entry) => entry.id));
+    return {};
+  }
+
+  /**
+   * Runs a purge. A failed one may have deleted part of what it was given
+   * (its delta is lost): changeTree takes the session's tree again, and the
+   * open Trash dialog is drawn from it, so it lists what is really left.
+   */
+  private async deleteFromTrash(overlay: HTMLElement, failure: string, purge: () => Promise<{ tree?: TreeDelta | null }>, reopen: boolean): Promise<void> {
+    const generation = this.authGeneration;
+    let failed: unknown = null;
+    try {
+      await this.changeTree(purge());
+    } catch (error) { failed = error; }
+    if (generation !== this.authGeneration) return;
+    if (this.tree.behind) await this.resyncTree(false);
+    overlay.remove(); this.renderTree();
+    if (reopen || failed) this.showTrash();
+    if (failed) await this.message(failure, ipcMessage(failed));
   }
 
   private modal(title: string, description = "", onDismiss?: () => void): HTMLElement {
@@ -2349,6 +3249,8 @@ class App {
       const overlay = this.modal(title, description, resolve); const body = overlay.querySelector<HTMLElement>(".modal-body")!;
       body.innerHTML = `<div class="modal-actions"><button class="button button-primary">OK</button></div>`;
       body.querySelector("button")!.addEventListener("click", () => { overlay.remove(); resolve(); }); this.showModal(overlay);
+      // As confirm() does: Enter and Escape reach the dialog also when what opened it lost focus to the inert page.
+      body.querySelector<HTMLButtonElement>("button")!.focus();
     });
   }
 
@@ -2378,6 +3280,16 @@ class App {
   }
 
   private onKeyDown = (event: KeyboardEvent): void => {
+    // A document window has no sidebar, workspace or lock: only Cmd/Ctrl+S.
+    if (this.docWindow) {
+      if ((isMac ? event.metaKey : event.ctrlKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void this.documents.save();
+      }
+      return;
+    }
+    // F2 and Delete act on the sidebar's selection, which focus mode hides.
+    if (this.focusMode && ["F2", "Backspace", "Delete"].includes(event.key)) return;
     if (event.key === "F2" && !isTypingTarget(event.target)) {
       const node = this.tree.get(this.selected);
       if (node && ["Folder", "Document"].includes(kindName(node))) {
@@ -2394,10 +3306,13 @@ class App {
     }
     const mod = isMac ? event.metaKey : event.ctrlKey;
     if (!mod) return;
+    // Quick open, New file and New folder use the sidebar: focus mode ends first.
+    if (this.focusMode && ["n", "p"].includes(event.key.toLowerCase())) this.leaveFocusMode();
     if (event.key.toLowerCase() === "s") {
       event.preventDefault();
-      // A document without unsynced edits sends nothing.
-      void this.documents.save();
+      // A document without unsynced edits sends nothing. While Rust renames
+      // or moves a document window's document, it uploads the edit itself.
+      if (this.moveFreezes === 0) void this.documents.save();
     } else if (event.key.toLowerCase() === "n" && !event.shiftKey) {
       event.preventDefault(); void this.createFile();
     } else if (event.key.toLowerCase() === "n" && event.shiftKey) {
@@ -2407,12 +3322,323 @@ class App {
     } else if (event.key.toLowerCase() === "p") {
       event.preventDefault();
       this.root.querySelector<HTMLInputElement>(".search")?.focus();
-    } else if (event.key.toLowerCase() === "v" && event.shiftKey) {
-      event.preventDefault();
-      this.previewMode = this.previewMode === "edit" ? "split" : this.previewMode === "split" ? "preview" : "edit";
-      this.applyPreviewMode();
     }
   };
+
+  /**
+   * F9 (focus mode), Esc (leaves it), Cmd+Shift+V (Ctrl+Shift+V off
+   * macOS; reading and writing), Cmd/Ctrl+Shift+O (Open in new window) and
+   * the zoom keys (zoomKeyApplies), caught in the capture phase
+   * ahead of the editor, so it never pastes on Cmd+Shift+V. Text fields outside
+   * the editor and dialogs keep Cmd+Shift+V and Esc; no shortcut works under
+   * a dialog.
+   */
+  private onViewKey = (event: KeyboardEvent): void => {
+    if (event.isComposing) return;
+    if (this.scrollFrame(event)) {
+      event.preventDefault();
+      return;
+    }
+    const zoom = zoomKey(event, isMac);
+    if (zoom && this.zoomKeyApplies()) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!event.repeat) this.zoomContent(zoom);
+      return;
+    }
+    const command = viewKey(event, isMac);
+    if (!command || !this.editor || topModal()) return;
+    const inEditor = event.target instanceof Element && event.target.closest(".cm-editor") !== null;
+    if (command === "escape") {
+      // Menus and the word count close on Esc themselves; the editor keeps Esc.
+      if (!this.focusMode || this.docWindow || isTypingTarget(event.target) || document.querySelector(".context-menu, .word-count-panel")) return;
+      event.preventDefault();
+      this.leaveFocusMode();
+      return;
+    }
+    if (command === "read-write" && !inEditor && isTypingTarget(event.target)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.repeat) return;
+    if (command === "read-write") this.toggleReadWrite();
+    // A document window has no chrome to bring back and opens no other window.
+    else if (this.docWindow) return;
+    else if (command === "focus") this.toggleFocusMode();
+    else void this.openInNewWindow();
+  };
+
+  /** F9. Nothing happens without an open document. */
+  private toggleFocusMode(): void {
+    if (this.focusMode) this.leaveFocusMode();
+    else this.enterFocusMode();
+  }
+
+  /**
+   * Hides the sidebar, header, status bar and outline (one class on the
+   * shell, one relayout; the document, its editor state and the preview's
+   * DOM stay) and shows the document in Preview. The window title becomes
+   * the file name.
+   */
+  private enterFocusMode(): void {
+    const node = this.tree.get(this.documents.openId);
+    const shell = this.root.querySelector<HTMLElement>(".shell");
+    if (this.focusMode || !node || !shell || !this.editor) return;
+    this.contextMenu.close();
+    this.closeWordCount();
+    // WebKit keeps no scroll anchor when the text column widens: the
+    // reading position is taken before and given back after the relayout.
+    const place = this.readingPlace();
+    this.focusMode = true;
+    this.modeBeforeFocus = this.previewMode;
+    this.previewMode = "preview";
+    shell.classList.add("focus-mode");
+    this.applyPreviewMode();
+    this.restoreReadingPlace(place);
+    this.showWindowTitle(node.name);
+    this.focusPane();
+  }
+
+  /** F9 or Esc: the sidebar and header come back with the view mode from before (modeAfterFocus). */
+  private leaveFocusMode(): void {
+    // A document window is focus mode: there is nothing to bring back.
+    if (!this.focusMode || this.docWindow) return;
+    const place = this.readingPlace();
+    this.previewMode = modeAfterFocus(this.modeBeforeFocus, this.previewMode, this.writingMode);
+    this.endFocusState();
+    this.applyPreviewMode();
+    this.restoreReadingPlace(place);
+    // The pane shown takes the keys (the preview had them, and may be hidden
+    // now); the editor keeps its caret and selection on focus.
+    this.focusPane();
+  }
+
+  /** Focus mode off without a relayout (also when the workspace is left). */
+  private endFocusState(): void {
+    this.focusMode = false;
+    this.root.querySelector(".shell")?.classList.remove("focus-mode");
+    this.stopFrameWatch();
+    this.showWindowTitle(null);
+  }
+
+  /**
+   * Cmd+Shift+V: Preview and the last writing mode (Edit or Split); in
+   * focus mode Preview and the editor alone. The Edit / Split / Preview
+   * control follows, and the focus moves to what is now shown.
+   */
+  private toggleReadWrite(): void {
+    if (!this.documents.openId) return;
+    const place = this.readingPlace();
+    this.previewMode = toggledMode(this.previewMode, this.writingMode, this.focusMode);
+    this.applyPreviewMode();
+    this.restoreReadingPlace(place);
+    this.focusPane();
+  }
+
+  /**
+   * Where the reader is, before the view mode or focus mode changes: the
+   * editor's top line and the preview's top block, of the panes shown.
+   * A few layout reads (binary searches), so a 12 MB document costs the same.
+   */
+  private readingPlace(): ReadingPlace {
+    const editorShown = this.previewMode !== "preview";
+    const previewShown = this.previewMode !== "edit";
+    return {
+      editorLine: editorShown && this.editor ? this.editor.topLine() : null,
+      previewBlock: previewShown ? this.previewPlace() : null,
+      previewLine: previewShown && !editorShown ? this.previewTopLine() : null,
+    };
+  }
+
+  /**
+   * After the change (and its relayout): a pane that stays keeps its place,
+   * also when its column changed width; a pane shown now opens where the
+   * other one was, so Cmd+Shift+V writes what was being read and reads
+   * what was being written.
+   */
+  private restoreReadingPlace(place: ReadingPlace): void {
+    if (this.previewMode !== "preview" && this.editor) {
+      const line = place.editorLine ?? place.previewLine;
+      if (line !== null) this.editor.showLine(line, place.editorLine === null);
+    }
+    if (this.previewMode !== "edit") {
+      if (place.previewBlock) this.restorePreviewPlace(place.previewBlock);
+      else if (place.editorLine !== null) this.showPreviewLine(place.editorLine);
+    }
+  }
+
+  /** The block at the preview's top (binary search over its blocks), or the page's scroll share. */
+  private previewPlace(): PreviewPlace | null {
+    const host = this.root.querySelector<HTMLElement>(".preview");
+    if (!host) return null;
+    if (host.classList.contains("html-mode")) {
+      const page = this.htmlPreview.scroller();
+      return page ? { ratio: page.scrollTop / Math.max(1, page.scrollHeight - page.clientHeight) } : null;
+    }
+    const top = host.getBoundingClientRect().top;
+    const blocks = host.children;
+    const element = blocks[lastAtOrBefore(blocks.length, (index) => blocks[index]!.getBoundingClientRect().bottom, top) + 1];
+    if (!element) return null;
+    const box = element.getBoundingClientRect();
+    return {
+      element,
+      fraction: box.height > 0 ? Math.min(1, Math.max(0, (top - box.top) / box.height)) : 0,
+      offset: Math.max(0, box.top - top),
+    };
+  }
+
+  private restorePreviewPlace(place: PreviewPlace): void {
+    const host = this.root.querySelector<HTMLElement>(".preview");
+    if (!host) return;
+    if ("ratio" in place) {
+      const page = this.htmlPreview.scroller();
+      if (page) page.scrollTop = place.ratio * Math.max(0, page.scrollHeight - page.clientHeight);
+      return;
+    }
+    if (place.element.parentElement !== host) return;
+    const box = place.element.getBoundingClientRect();
+    host.scrollTop += box.top + place.fraction * box.height - place.offset - host.getBoundingClientRect().top;
+  }
+
+  /**
+   * The source line at the preview's top. Null when the preview has nothing
+   * to scroll (a short page, or "Preview paused" for a large document): it
+   * then says nothing about where the reader is, and the editor keeps its place.
+   */
+  private previewTopLine(): number | null {
+    const preview = this.previewTrack();
+    if (!preview || preview.track.height - preview.viewport < 1) return null;
+    return lineForPreviewOffset(preview.track, preview.offset);
+  }
+
+  /** Scrolls the preview to source line `line`, now or once the render in flight is in. */
+  private showPreviewLine(line: number): void {
+    this.previewLineWanted = line;
+    if (this.previewInFlight === null) this.applyPreviewLine();
+  }
+
+  private applyPreviewLine(): void {
+    const line = this.previewLineWanted;
+    this.previewLineWanted = null;
+    if (line === null || this.previewMode === "edit") return;
+    const preview = this.previewTrack();
+    preview?.scrollTo(previewOffsetForLine(preview.track, line));
+  }
+
+  /**
+   * The preview's scroll and the headings that tie it to source lines:
+   * Markdown headings, when the preview has exactly the ones the source has
+   * (else proportional, as for HTML pages, plain text and large documents).
+   */
+  private previewTrack(): { track: HeadingTrack; offset: number; viewport: number; scrollTo(top: number): void } | null {
+    const host = this.root.querySelector<HTMLElement>(".preview");
+    const editor = this.editor;
+    if (!host || !editor?.hasDocument) return null;
+    const lastLine = editor.lineCount;
+    if (host.classList.contains("html-mode")) {
+      const page = this.htmlPreview.scroller();
+      if (!page) return null;
+      return {
+        track: { lines: [], top: () => 0, lastLine, height: page.scrollHeight },
+        offset: page.scrollTop,
+        viewport: page.clientHeight,
+        scrollTo: (top) => { page.scrollTop = top; },
+      };
+    }
+    const markdown = this.currentLanguage() === "markdown" && editor.length <= LARGE_PREVIEW_CHARS;
+    const headings = markdown ? host.querySelectorAll(PREVIEW_HEADINGS) : null;
+    const lines = headings ? this.headingLines() : [];
+    const origin = host.getBoundingClientRect().top - host.scrollTop;
+    return {
+      track: {
+        lines: headings && headings.length === lines.length ? lines : [],
+        top: (index) => headings![index]!.getBoundingClientRect().top - origin,
+        lastLine,
+        height: host.scrollHeight,
+      },
+      offset: host.scrollTop,
+      viewport: host.clientHeight,
+      scrollTo: (top) => { host.scrollTop = top; },
+    };
+  }
+
+  /** The source lines of the open document's headings, parsed once per text version. */
+  private headingLines(): readonly number[] {
+    const key = `${this.documents.openId}|${this.textVersion}`;
+    if (this.headingLineCache?.key !== key) {
+      const text = this.editor?.text() ?? "";
+      this.headingLineCache = { key, lines: flattenOutline(parseMarkdownOutline(text)).map((item) => item.line) };
+    }
+    return this.headingLineCache.lines;
+  }
+
+  /** The editor when writing, else the preview, so arrow and page keys scroll what is shown. */
+  private focusPane(): void {
+    if (this.previewMode !== "preview") {
+      this.editor?.focus();
+      return;
+    }
+    this.root.querySelector<HTMLElement>(".preview")?.focus({ preventScroll: true });
+  }
+
+  /**
+   * The OS window title: the file name in focus mode, otherwise "Notebook".
+   * Written only when it changes (one IPC call).
+   */
+  private showWindowTitle(name: string | null): void {
+    const title = name || APP_TITLE;
+    if (title === this.windowTitle) return;
+    this.windowTitle = title;
+    document.title = title;
+    // Rust titles a document window (window.rs).
+    if (isTauri && !this.docWindow) void getCurrentWindow().setTitle(title).catch(() => { /* Cosmetic: the next change retries. */ });
+  }
+
+  /**
+   * An HTML page's frame keeps every key once clicked (WebKit runs no
+   * listener in it). While a page is shown (Split, Preview, focus mode, a
+   * document window), the keys come back to the preview after a click in
+   * it once no text is selected there, so F9, Esc, Cmd+S and the zoom keys
+   * work again; Copy still works while text is selected. Arrow, page and
+   * space keys then scroll the page (scrollFrame). A poll, because a click
+   * that activates the window right in the page sends the parent no event.
+   */
+  private syncFrameWatch(): void {
+    const wanted = this.previewMode !== "edit" && this.currentLanguage() === "html";
+    if (!wanted) { this.stopFrameWatch(); return; }
+    this.frameWatch ??= window.setInterval(() => {
+      const frame = document.activeElement;
+      if (!(frame instanceof HTMLIFrameElement) || !frame.closest(".preview")) return;
+      // The mouse button is still down in the page (WebKit marks the frame
+      // element :active): a drag that has not moved yet selects nothing.
+      if (frame.matches(":active")) return;
+      let selected = false;
+      try { selected = !(frame.contentWindow?.getSelection()?.isCollapsed ?? true); } catch { /* Not our page: take the keys back. */ }
+      if (!selected) this.root.querySelector<HTMLElement>(".preview")?.focus({ preventScroll: true });
+    }, FRAME_FOCUS_POLL_MS);
+  }
+
+  /** Arrow, page, space, Home and End keys on the preview of an HTML page scroll the page in its frame. */
+  private scrollFrame(event: KeyboardEvent): boolean {
+    const host = event.target;
+    if (!(host instanceof HTMLElement) || !host.matches(".preview.html-mode") || event.metaKey || event.ctrlKey || event.altKey) return false;
+    if (event.shiftKey && event.key !== " ") return false;
+    const scroller = host.querySelector<HTMLIFrameElement>(".html-preview")?.contentDocument?.scrollingElement;
+    if (!scroller) return false;
+    const page = Math.max(FRAME_LINE_PX, scroller.clientHeight - FRAME_LINE_PX);
+    const steps: Record<string, number> = {
+      ArrowDown: FRAME_LINE_PX, ArrowUp: -FRAME_LINE_PX, PageDown: page, PageUp: -page,
+      " ": event.shiftKey ? -page : page, Home: -scroller.scrollHeight, End: scroller.scrollHeight,
+    };
+    const step = steps[event.key];
+    if (step === undefined) return false;
+    scroller.scrollBy(0, step);
+    return true;
+  }
+
+  private stopFrameWatch(): void {
+    if (this.frameWatch !== null) window.clearInterval(this.frameWatch);
+    this.frameWatch = null;
+  }
 
   private onTreeKeyDown(event: KeyboardEvent, node: TreeNode): void {
     const rows = [...this.root.querySelectorAll<HTMLElement>('.tree-row[data-node-id]')];
@@ -2463,7 +3689,8 @@ class App {
 
   /** A workspace whose phrase is remembered is not locked on idle: it would reopen without the user (Rust skips it too). */
   private armIdleLock(): void {
-    if (!isTauri) return;
+    // The main window runs the idle lock; a document window's typing reaches it through activity_ping.
+    if (!isTauri || this.docWindow) return;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.autoLockMinutes === 0 || this.activeWorkspace()?.phrase_stored) { this.idleTimer = null; return; }
     this.idleTimer = window.setTimeout(() => void this.lock(), this.autoLockMinutes * 60_000);
@@ -2502,9 +3729,10 @@ class App {
       event.preventDefault();
       event.stopPropagation();
       const parent = folderAt(event.target);
-      const files = Array.from(event.dataTransfer?.files ?? []);
+      // The entries must be taken while the event lasts.
+      const roots = droppedRoots(event.dataTransfer);
       clear();
-      void this.importFiles(files, parent);
+      void this.importDrop(roots, parent);
     });
     workspace.addEventListener("dragover", (event) => {
       if (!hasFiles(event)) return;
@@ -2514,66 +3742,166 @@ class App {
     workspace.addEventListener("drop", (event) => {
       if (!hasFiles(event)) return;
       event.preventDefault();
-      const files = Array.from(event.dataTransfer?.files ?? []);
-      void this.importFiles(files, this.selectedFolderId());
+      void this.importDrop(droppedRoots(event.dataTransfer), this.selectedFolderId());
     });
   }
 
-  private async importFiles(files: File[], parent: string): Promise<void> {
-    const accepted = files.filter(isImportableTextFile);
-    const failures = files.filter((file) => !isImportableTextFile(file)).map((file) => `${file.name}: unsupported file type`);
-    let lastCreated: string | null = null;
+  /**
+   * Imports dropped files and folders below `parent`: the folders first,
+   * level by level, then the documents, 8 requests at a time. The tree
+   * follows the returned deltas (no listing) and is drawn at most twice a
+   * second. Problems are reported in one dialog at the end.
+   */
+  private async importDrop(roots: Array<DroppedEntry | File>, parent: string): Promise<void> {
+    if (!roots.length) return;
+    if (this.importing) {
+      await this.message("Import in progress", "Wait until the current import has finished, then drop again.");
+      return;
+    }
+    this.importing = true;
+    // The sidebar shows the import's progress.
+    if (this.focusMode) this.leaveFocusMode();
+    // Locking or switching workspaces ends the import: no item may land in another workspace.
+    const generation = this.authGeneration;
+    let stopped = false;
+    const stale = (): boolean => (stopped ||= generation !== this.authGeneration);
     const sidebar = this.root.querySelector<HTMLElement>(".sidebar");
     const hintTitle = sidebar?.querySelector<HTMLElement>(".file-drop-hint strong");
-    if (accepted.length) {
-      sidebar?.classList.add("file-importing");
-      sidebar?.setAttribute("aria-busy", "true");
-      if (hintTitle) hintTitle.textContent = "Encrypting and uploading…";
-    }
+    sidebar?.classList.add("file-importing");
+    sidebar?.setAttribute("aria-busy", "true");
+    if (hintTitle) hintTitle.textContent = "Reading dropped items…";
+    let drawTimer: number | null = null;
+    let changed = false;
+    let resync = false;
+    const failed: Skip[] = [];
+    let skipped: Skip[] = [];
+    let hidden = 0;
+    let files = 0;
+    let folders = 0;
+    let lastLoose: string | null = null;
+    let refusal: string | null = null;
+    const topFolders: string[] = [];
+    // Bulk changes apply their deltas without drawing; a timer draws.
+    const apply = <T extends { id: string; tree?: TreeDelta | null }>(created: T): string => {
+      // A delta answered after a lock or switch belongs to the old session.
+      if (!stale()) this.applyTree(created.tree, false);
+      changed = true;
+      return created.id;
+    };
+    const createFolder = async (folderParent: string, name: string): Promise<string> => {
+      if (isTauri) return apply(await ipc.folderCreate(folderParent, name));
+      const id = crypto.randomUUID();
+      this.tree.change([{ id, parent: folderParent, name: uniqueName(this.tree.children(folderParent), name), kind: "Folder" }]);
+      changed = true;
+      return id;
+    };
+    const createDocument = async (folder: string, name: string, text: string): Promise<string> => {
+      if (isTauri) return apply(await ipc.docCreate(folder, name, text));
+      const id = crypto.randomUUID();
+      this.tree.change([{ id, parent: folder, name: uniqueName(this.tree.children(folder), name), kind: "Document" }]);
+      this.docs.set(id, { text, readOnly: false });
+      changed = true;
+      return id;
+    };
     try {
-      for (const file of accepted) {
-        try {
-          if (file.size > MAX_IMPORT_BYTES) throw new Error("files are limited to 16 MiB");
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
-          if (isTauri) {
-            lastCreated = (await this.changeTree(ipc.docCreate(parent, file.name, text))).id;
-          } else {
-            const id = crypto.randomUUID();
-            const name = uniqueName(this.tree.children(parent), file.name);
-            this.tree.change([{ id, parent, name, kind: "Document" }]);
-            this.docs.set(id, { text, readOnly: false });
-            lastCreated = id;
-          }
-        } catch (caught) {
-          failures.push(`${file.name}: ${safeErrorMessage(caught, "could not import")}`);
-        }
+      const scan = await scanDrop(roots);
+      if (scan.over) {
+        refusal = limitMessage(scan.over);
+        return;
       }
-      this.expanded.add(parent);
-      this.renderTree();
-      if (lastCreated) await this.openDocument(lastCreated);
+      hidden = scan.hidden;
+      const plan = planImport(scan, this.tree.children(parent).map((node) => node.name));
+      skipped = plan.skipped;
+      const total = plan.folders.length + plan.files.length;
+      let done = 0;
+      const step = (): void => {
+        done++;
+        if (hintTitle) hintTitle.textContent = importProgress(done, total);
+      };
+      if (hintTitle && total) hintTitle.textContent = importProgress(0, total);
+      drawTimer = window.setInterval(() => {
+        if (changed) { changed = false; this.renderTree(); }
+      }, 500);
+      const folderIds = new Map<number, string>();
+      for (const level of foldersByLevel(plan.folders)) {
+        await runPool(level, IMPORT_PARALLEL, async (folder) => {
+          if (stale()) return;
+          const inside = folder.parent === null ? parent : folderIds.get(folder.parent);
+          try {
+            if (inside === undefined) throw new Error("its folder could not be created");
+            const id = await createFolder(inside, folder.name);
+            folderIds.set(folder.index, id);
+            folders++;
+            if (folder.parent === null) topFolders.push(id);
+          } catch (caught) {
+            resync = true;
+            failed.push({ path: folder.path, reason: safeErrorMessage(caught, "could not be created") });
+          }
+          step();
+        });
+      }
+      await runPool(plan.files, IMPORT_PARALLEL, async (file) => {
+        if (stale()) return;
+        const inside = file.folder === null ? parent : folderIds.get(file.folder);
+        try {
+          if (inside === undefined) throw new Error("its folder could not be created");
+          const text = await readImportText(file.file);
+          // A lock or switch can happen while a slow file (iCloud, network) is
+          // read: check again with no await before the request.
+          if (stale()) return;
+          const id = await createDocument(inside, file.name, text);
+          files++;
+          if (file.folder === null) lastLoose = id;
+        } catch (caught) {
+          if (isIpcFailure(caught)) resync = true;
+          failed.push({ path: file.path, reason: safeErrorMessage(caught, "could not be imported") });
+        }
+        step();
+      });
     } catch (caught) {
-      failures.push(`Workspace refresh: ${safeErrorMessage(caught, "imported files will appear after the next refresh")}`);
+      failed.push({ path: "Import", reason: safeErrorMessage(caught, "the drop could not be read") });
     } finally {
+      if (drawTimer !== null) clearInterval(drawTimer);
+      // Ids are paths: after a lock or switch they would name items of another workspace.
+      if (!stale()) {
+        // A failed change may have happened in part: take the session's tree (no S3 request).
+        if (resync) await this.resyncTree(false);
+        this.expanded.add(parent);
+        for (const id of topFolders) this.expanded.add(id);
+        if (!lastLoose && topFolders.length === 1) this.selected = topFolders[0]!;
+        this.renderTree();
+      }
       sidebar?.classList.remove("file-importing");
       sidebar?.removeAttribute("aria-busy");
       if (hintTitle) hintTitle.textContent = "Import files";
+      this.importing = false;
+      // Shown once the sidebar is idle again; nothing was created.
+      if (refusal && !stale()) void this.message("Too many items to import", refusal);
     }
-    if (failures.length) {
-      await this.message(
-        lastCreated ? "Some files were not imported" : "No files were imported",
-        failures.join("\n"),
-      );
+    if (stale()) {
+      // No names: the summary would otherwise show over the lock screen.
+      if (this.screen === "main") await this.message("Import stopped", importStopped(files, folders));
+      return;
     }
+    if (lastLoose) await this.openDocument(lastLoose);
+    const summary = importSummary({ files, folders, skipped, failed, hidden });
+    if (summary) await this.message(summary.title, summary.text);
   }
 
+  // A paste or drop in the find panel (inside .editor-host) is its input's,
+  // never an image for the document.
   private async onImagePaste(event: ClipboardEvent): Promise<void> {
+    if (inFindPanel(event)) return;
     const files = imageFiles(event.clipboardData?.files);
     if (!this.editor || !this.documents.openId || !files.length) return;
     event.preventDefault();
+    // Read-only: nothing is encrypted for an edit that would be refused.
+    if (this.editor.isReadOnly) { this.editor.noteReadOnly(); return; }
     await this.insertImages(files);
   }
 
   private onImageDragOver = (event: DragEvent): void => {
+    if (inFindPanel(event)) return;
     if (!this.editor || !this.documents.openId || !event.dataTransfer?.types.includes("Files")) return;
     event.preventDefault();
     event.stopPropagation();
@@ -2581,13 +3909,15 @@ class App {
   };
 
   private async onImageDrop(event: DragEvent): Promise<void> {
+    // Refused by navigation.ts's drop listener, so the WebView never loads it.
+    if (inFindPanel(event)) return;
     const files = imageFiles(event.dataTransfer?.files);
     if (!this.editor || !this.documents.openId || !files.length) return;
     event.preventDefault();
     event.stopPropagation();
-    const position = this.editor.getTargetAtClientPoint(event.clientX, event.clientY)?.position ?? this.editor.getPosition();
-    if (position) this.editor.setPosition(position);
+    this.editor.placeCaretAt(event.clientX, event.clientY);
     this.editor.focus();
+    if (this.editor.isReadOnly) { this.editor.noteReadOnly(); return; }
     await this.insertImages(files);
   }
 
@@ -2608,9 +3938,7 @@ class App {
       }
       if (!this.editor || this.documents.openId !== id) return;
       const label = file.name.replace(/[\[\]()]/g, "_") || "image";
-      const selection = this.editor.getSelection();
-      if (!selection) continue;
-      this.editor.executeEdits("insert-image", [{ range: selection, text: `![${label}](${dataUrl})`, forceMoveMarkers: true }]);
+      this.editor.insertText(`![${label}](${dataUrl})`);
     }
   }
 
@@ -2638,12 +3966,29 @@ function uploadQueuedEdits(): Promise<void> {
   return within(flushed, SAVE_TIMING.exitBudgetMs);
 }
 
+/** Whether `event` happened in the editor's find panel. */
+function inFindPanel(event: Event): boolean {
+  return event.target instanceof Element && event.target.closest(".cm-panels") !== null;
+}
+
 function imageFiles(files: FileList | null | undefined): File[] {
   return Array.from(files ?? []).filter((file) => IMAGE_TYPE.test(file.type));
 }
 
-function isImportableTextFile(file: File): boolean {
-  return /\.(?:md|markdown|txt|html?)$/i.test(file.name) || /^text\//i.test(file.type);
+/**
+ * The dropped items as entries (folders included) where the webview offers
+ * them, else as Files. Must run while the drop event lasts.
+ */
+function droppedRoots(transfer: DataTransfer | null): Array<DroppedEntry | File> {
+  if (!transfer) return [];
+  const items = Array.from(transfer.items ?? []).filter((item) => item.kind === "file");
+  if (!items.length) return Array.from(transfer.files);
+  return items.flatMap((item): Array<DroppedEntry | File> => {
+    const entry = typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null;
+    if (entry) return [entry];
+    const file = item.getAsFile();
+    return file ? [file] : [];
+  });
 }
 
 function initialDocumentText(name: string): string {
@@ -2666,16 +4011,9 @@ function treeOf(nodes: TreeNode[]): TreeModel {
   return tree;
 }
 
+/** `wanted`, or `wanted 2`… when a sibling has that name (without case, as the backend compares). */
 function uniqueName(siblings: readonly TreeNode[], wanted: string): string {
-  const taken = new Set(siblings.map((node) => node.name.toLocaleLowerCase()));
-  if (!taken.has(wanted.toLocaleLowerCase())) return wanted;
-  const dot = wanted.lastIndexOf(".");
-  const stem = dot > 0 ? wanted.slice(0, dot) : wanted;
-  const extension = dot > 0 ? wanted.slice(dot) : "";
-  for (let number = 2; ; number++) {
-    const candidate = `${stem} ${number}${extension}`;
-    if (!taken.has(candidate.toLocaleLowerCase())) return candidate;
-  }
+  return uniqueAmong(new Set(siblings.map((node) => node.name.toLowerCase())), wanted);
 }
 
 function trashEntryId(entry: TreeNode): string {
@@ -2714,7 +4052,7 @@ function trashDeletedAt(entry: TreeNode): string {
 }
 
 function isTypingTarget(target: EventTarget | null): boolean {
-  return target instanceof Element && target.closest("input, textarea, select, [contenteditable], .monaco-editor, .modal-overlay") !== null;
+  return target instanceof Element && target.closest("input, textarea, select, [contenteditable], .cm-editor, .modal-overlay") !== null;
 }
 
 function keychainUnavailableMessage(): string {
@@ -2946,12 +4284,13 @@ function languageLabel(language: DocumentLanguage): string {
   return "Markdown";
 }
 
-function flattenOutline(items: OutlineItem[]): OutlineItem[] {
+/** Every item in document order; the children of those in `collapsed` left out. */
+function flattenOutline(items: OutlineItem[], collapsed?: ReadonlySet<string>): OutlineItem[] {
   const flattened: OutlineItem[] = [];
   const visit = (children: OutlineItem[]): void => {
     for (const item of children) {
       flattened.push(item);
-      visit(item.children);
+      if (!collapsed?.has(item.id)) visit(item.children);
     }
   };
   visit(items);
@@ -2989,6 +4328,7 @@ function renderMarkdown(source: string): string {
   const escaped = escapeHtml(source);
   const lines = escaped.split(/\r?\n/);
   const html: string[] = [];
+  const ids = new HeadingIds();
   let inList = false;
   let inCode = false;
   for (const raw of lines) {
@@ -3006,7 +4346,7 @@ function renderMarkdown(source: string): string {
     }
     if (inList) { html.push("</ul>"); inList = false; }
     const heading = /^(#{1,6})\s+(.*)$/.exec(raw);
-    if (heading) { const level = heading[1]!.length; html.push(`<h${level}>${inline(heading[2]!)}</h${level}>`); }
+    if (heading) { const level = heading[1]!.length; html.push(`<h${level} id="${escapeHtml(ids.next(plainHeading(heading[2]!)))}">${inline(heading[2]!)}</h${level}>`); }
     else if (raw.startsWith("> ")) html.push(`<blockquote>${inline(raw.slice(2))}</blockquote>`);
     else if (raw.trim()) html.push(`<p>${inline(raw)}</p>`);
   }
@@ -3022,7 +4362,24 @@ function inline(value: string): string {
     .replace(/\*([^*]+)\*/g, "<em>$1</em>")
     .replace(/!\[([^\]]*)\]\(([^\s)]*)\)/g, (_, alt: string, src: string) =>
       SAFE_IMAGE_SRC.test(src) ? `<img src="${src}" alt="${alt}" loading="lazy">` : '<span class="blocked-image">Image blocked</span>')
-    .replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:)[^\s)]+)\)/g, '<a href="$2" rel="noopener noreferrer">$1</a>');
+    .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, target: string, alias: string | undefined) =>
+      anchor(wikiHref(unescapeHtml(target)), alias ?? target))
+    .replace(/\[([^\]]+)\]\(([^\s)]+)\)/g, (_, text: string, dest: string) => anchor(previewHref(unescapeHtml(dest)), text));
+}
+
+/** A link of the stand-in renderer; `text` is escaped already. */
+function anchor(href: string | null, text: string): string {
+  return href === null ? `<a>${text}</a>` : `<a href="${escapeHtml(href)}" rel="noopener noreferrer">${text}</a>`;
+}
+
+function unescapeHtml(value: string): string {
+  return value.replace(/&(amp|lt|gt|quot|#39);/g, (_, name: string) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" })[name]!);
+}
+
+/** A heading's text without inline Markdown, for its id (the stand-in renderer). */
+/** The text a heading's id comes from: wikilinks give their shown text, the rest as the outline's labels (outline.ts). */
+function plainHeading(escaped: string): string {
+  return headingText(unescapeHtml(escaped.replace(/!?\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, text: string, alias?: string) => alias ?? text)));
 }
 
 export const started = new App().start();

@@ -1,12 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { type PanelLayout, type PanelLayoutWire, layoutFromWire } from "./panel-layout";
+import { zoomFromWire } from "./preview-zoom";
 import { type Accent, DEFAULT_ACCENT, isAccent } from "./theme";
 import { workspacePayload } from "./workspaces";
 
 export type ThemePreference = "System" | "Light" | "Dark";
 
 /** `config_get`: the global preferences and the active workspace (if any). */
-export interface VaultConfig {
+interface VaultConfig {
   workspace_id?: string | null;
   workspace_name?: string | null;
   bucket: string;
@@ -18,6 +19,8 @@ export interface VaultConfig {
   accent: Accent;
   /** Pane sizes; configs written before them get the defaults. */
   layout: PanelLayout;
+  /** The preview zoom in percent (config.json "layout".preview_zoom); 100 when missing. */
+  preview_zoom: number;
   credentials_stored: boolean;
   /** The active workspace's encryption phrase is remembered on this device. */
   phrase_stored?: boolean;
@@ -65,17 +68,11 @@ export interface WorkspaceInput {
   leave_pending?: boolean;
 }
 
-export interface CredentialsInput {
+interface CredentialsInput {
   access_key_id: string;
   secret_access_key: string;
   session_token?: string | null;
 }
-
-export type ConnectionResult =
-  | "VaultFound"
-  | "NoVault"
-  | "AccessDenied"
-  | "Unreachable";
 
 export type NodeKindName =
   | "Root"
@@ -86,7 +83,7 @@ export type NodeKindName =
   | "TrashOrigin";
 
 /** A Trash entry as Notebook lists it. Paths are workspace-relative. */
-export interface OriginSummary {
+interface OriginSummary {
   name: string;
   original_path: string;
   /** The original parent folder; "" is the workspace root. */
@@ -128,13 +125,13 @@ export interface TreeDelta {
   remove: string[];
 }
 
-export interface CreatedNode {
+interface CreatedNode {
   id: string;
   final_name?: string;
   tree?: TreeDelta;
 }
 
-export interface TrashResult {
+interface TrashResult {
   entry_id: string;
   tree?: TreeDelta;
 }
@@ -146,7 +143,7 @@ export interface RestoreResult {
   tree?: TreeDelta;
 }
 
-export interface PurgeResult {
+interface PurgeResult {
   documents: number;
   folders: number;
   images: number;
@@ -154,25 +151,55 @@ export interface PurgeResult {
 }
 
 /** "Original" restores to the original path; `To` names a folder id. */
-export type RestoreMode = "Original" | { To: string };
+type RestoreMode = "Original" | { To: string };
 
-export interface OpenDocument {
-  text: string;
-  rev: number;
+interface OpenDocument {
+  /** Null when `knownRev` was this text's rev: the editor still holds it. */
+  text: string | null;
+  /** The text's SHA-256 (hex), passed back as `knownRev`. */
+  rev: string;
   read_only: boolean;
   rollback_warning: boolean;
   /** The text is an edit from the local outbox that S3 does not hold yet. */
   dirty: boolean;
 }
 
-export interface SaveResult {
+/**
+ * `document_window_info`: what a document window shows, answered by its
+ * label (window.rs), never by its URL.
+ */
+interface DocumentWindowInfo {
+  id: string;
+  name: string;
+  /** The document's vault path ("Notes/plan.md"); its preview's relative links start in its folder. */
+  path: string;
+  theme: ThemePreference;
+  accent: Accent;
+  /** The global preview zoom in percent. */
+  preview_zoom: number;
+}
+
+/** `document-link`: a document window's preview link (`nb-doc:` / `nb-wiki:`) for the main window, from the folder of `from`. */
+export interface DocumentLink {
+  from: string;
+  href: string;
+}
+
+/** `document-window-moved`: a rename, move or conflict copy gave the window's document a new id. */
+export interface HeldMove {
+  from: string;
+  to: string;
+  name: string;
+}
+
+interface SaveResult {
   status: "Saved" | "Offline" | "ConflictCopy";
   document_id?: string | null;
   /** A conflict copy joined the tree. */
   tree?: TreeDelta;
 }
 
-export interface PassphraseChangeResult {
+interface PassphraseChangeResult {
   cleanup_pending: boolean;
 }
 
@@ -186,7 +213,7 @@ function optionalString(value: string): string | null {
   return clean.length > 0 ? clean : null;
 }
 
-export function normalizeConfig(raw: Omit<VaultConfig, "layout"> & { layout?: unknown }): VaultConfig {
+function normalizeConfig(raw: Omit<VaultConfig, "layout" | "preview_zoom"> & { layout?: unknown }): VaultConfig {
   const record = raw as VaultConfig & {
     autoLockMinutes?: number;
     credentialsStored?: boolean;
@@ -203,6 +230,7 @@ export function normalizeConfig(raw: Omit<VaultConfig, "layout"> & { layout?: un
     theme: raw.theme ?? "System",
     accent: isAccent(raw.accent) ? raw.accent : DEFAULT_ACCENT,
     layout: layoutFromWire(raw.layout),
+    preview_zoom: zoomFromWire(raw.layout),
     credentials_stored:
       raw.credentials_stored ?? record.credentialsStored ?? false,
     phrase_stored: raw.phrase_stored ?? false,
@@ -211,15 +239,12 @@ export function normalizeConfig(raw: Omit<VaultConfig, "layout"> & { layout?: un
   };
 }
 
-export function normalizeSnapshot(raw: TreeSnapshot | TreeNode[]): TreeSnapshot {
+function normalizeSnapshot(raw: TreeSnapshot | TreeNode[]): TreeSnapshot {
   return Array.isArray(raw) ? { nodes: raw } : raw;
 }
 
-export function kindName(node: TreeNode): NodeKindName {
-  if (typeof node.kind === "string") return node.kind;
-  const first = Object.keys(node.kind)[0];
-  return (first as NodeKindName | undefined) ?? "Document";
-}
+// In tree-model.ts, which has no runtime imports, so Node's unit tests can load it.
+export { kindName } from "./tree-model";
 
 export function isIpcFailure(value: unknown): value is IpcFailure {
   if (typeof value !== "object" || value === null) return false;
@@ -253,19 +278,16 @@ export function safeErrorMessage(
 
 export const ipc = {
   configGet: async (): Promise<VaultConfig> =>
-    normalizeConfig(await invoke<Omit<VaultConfig, "layout"> & { layout?: unknown }>("config_get")),
+    normalizeConfig(await invoke<Omit<VaultConfig, "layout" | "preview_zoom"> & { layout?: unknown }>("config_get")),
 
-  /** Pane sizes, saved with the global preferences; never an S3 request. */
-  layoutSet: async (layout: PanelLayoutWire): Promise<void> => invoke("layout_set", { ...layout }),
+  /** Pane sizes or the preview zoom, saved with the global preferences (Rust keeps the values not given); never an S3 request. */
+  layoutSet: async (layout: Partial<PanelLayoutWire & { preview_zoom: number }>): Promise<void> => invoke("layout_set", { ...layout }),
 
   settingsSet: async (
     autoLockMinutes: number,
     theme: ThemePreference,
     accent: Accent,
   ): Promise<void> => invoke("settings_set", { autoLockMinutes, theme, accent }),
-
-  connectionTest: async (): Promise<ConnectionResult> =>
-    invoke<ConnectionResult>("connection_test"),
 
   /**
    * Without `passphrase` the remembered phrase is used (`NO_STORED_PHRASE` when
@@ -328,11 +350,10 @@ export const ipc = {
     invoke("trash_purge", { entryIds }),
   trashEmpty: async (): Promise<PurgeResult> => invoke("trash_empty"),
 
-  searchTitles: async (query: string, includeTrash: boolean): Promise<string[]> =>
-    invoke("search_titles", { query, includeTrash }),
-  docOpen: async (id: string): Promise<OpenDocument> => invoke("doc_open", { id }),
-  /** Writes the edit to the encrypted local outbox; no S3 request. */
-  docStage: async (id: string, text: string): Promise<"Clean" | "Staged"> =>
+  docOpen: async (id: string, knownRev: string | null = null): Promise<OpenDocument> =>
+    invoke("doc_open", { id, knownRev }),
+  /** Writes the edit to the encrypted local outbox; no S3 request. `rev`: the text's, as doc_open gives it. */
+  docStage: async (id: string, text: string): Promise<{ status: "Clean" | "Staged"; rev: string }> =>
     invoke("doc_stage", { id, text }),
   /** Uploads the staged edit, if any (otherwise no S3 request). */
   docCommit: async (id: string): Promise<SaveResult> => invoke("doc_commit", { id }),
@@ -344,6 +365,23 @@ export const ipc = {
   previewRender: async (text: string): Promise<string> =>
     invoke<string>("preview_render", { text }),
   linkOpen: async (url: string): Promise<void> => invoke("link_open", { url }),
+  /** Main window: `documentId` moves to a window of its own, which writes it (or that window is shown). */
+  openDocumentWindow: async (documentId: string): Promise<void> =>
+    invoke("open_document_window", { documentId }),
+  /** Main window: every document window saves and closes (lock, switch, quit); fails when one stays open. */
+  documentWindowsClose: async (): Promise<void> => invoke("document_windows_close"),
+  documentWindowInfo: async (): Promise<DocumentWindowInfo> => {
+    const info = await invoke<DocumentWindowInfo>("document_window_info");
+    const theme: ThemePreference = info.theme === "Light" || info.theme === "Dark" ? info.theme : "System";
+    return { ...info, theme, accent: isAccent(info.accent) ? info.accent : DEFAULT_ACCENT, preview_zoom: zoomFromWire(info) };
+  },
+  /** A document window: the main window opens the vault document `href` links to, from this window's document, and comes to the front. */
+  documentLinkOpen: async (href: string): Promise<void> => invoke("document_link_open", { href }),
+  /** A document window's Close window button: it closes itself (through the close guard), never another window. */
+  documentWindowClose: async (): Promise<void> => invoke("document_window_close"),
+  /** A document window wrote its pending edit to the outbox, as Rust asked (`request`). */
+  documentWindowFlushed: async (request: number): Promise<void> =>
+    invoke("document_window_flushed", { request }),
   /** Ends a close that waited for the open document to be saved. */
   closeAfterFlush: async (): Promise<void> => invoke("close_after_flush"),
   cancelClose: async (): Promise<void> => invoke("cancel_close"),

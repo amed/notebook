@@ -363,22 +363,16 @@
           "markdownDescription": "Cancel a pending guarded close after a save failure."
         },
         {
-          "description": "Close the main window once a pending close has saved the open document.",
+          "description": "Close the calling window once a pending close has saved its open document.",
           "type": "string",
           "const": "allow-close-after-flush",
-          "markdownDescription": "Close the main window once a pending close has saved the open document."
+          "markdownDescription": "Close the calling window once a pending close has saved its open document."
         },
         {
           "description": "Read the preferences and the active workspace's non-secret configuration.",
           "type": "string",
           "const": "allow-config-get",
           "markdownDescription": "Read the preferences and the active workspace's non-secret configuration."
-        },
-        {
-          "description": "Test the configured S3 index object.",
-          "type": "string",
-          "const": "allow-connection-test",
-          "markdownDescription": "Test the configured S3 index object."
         },
         {
           "description": "Upload the staged edit of a document to S3.",
@@ -403,6 +397,36 @@
           "type": "string",
           "const": "allow-doc-stage",
           "markdownDescription": "Write an edit of an open document to the encrypted local outbox."
+        },
+        {
+          "description": "Ask the main window to open a vault document linked from the calling document window's preview, resolved from that window's document.",
+          "type": "string",
+          "const": "allow-document-link-open",
+          "markdownDescription": "Ask the main window to open a vault document linked from the calling document window's preview, resolved from that window's document."
+        },
+        {
+          "description": "A document window closes itself (its Close window button), through the close guard.",
+          "type": "string",
+          "const": "allow-document-window-close",
+          "markdownDescription": "A document window closes itself (its Close window button), through the close guard."
+        },
+        {
+          "description": "Report that the calling document window wrote its pending edit to the outbox.",
+          "type": "string",
+          "const": "allow-document-window-flushed",
+          "markdownDescription": "Report that the calling document window wrote its pending edit to the outbox."
+        },
+        {
+          "description": "Read which document the calling document window holds, checked by its label and session.",
+          "type": "string",
+          "const": "allow-document-window-info",
+          "markdownDescription": "Read which document the calling document window holds, checked by its label and session."
+        },
+        {
+          "description": "Save and close every document window before a lock, switch or quit (main window only).",
+          "type": "string",
+          "const": "allow-document-windows-close",
+          "markdownDescription": "Save and close every document window before a lock, switch or quit (main window only)."
         },
         {
           "description": "Flush pending encrypted writes.",
@@ -453,6 +477,12 @@
           "markdownDescription": "Move a live node to encrypted-index Trash."
         },
         {
+          "description": "Open a document in a window of its own, which then writes it (main window only).",
+          "type": "string",
+          "const": "allow-open-document-window",
+          "markdownDescription": "Open a document in a window of its own, which then writes it (main window only)."
+        },
+        {
           "description": "Rewrap the vault key with a new passphrase.",
           "type": "string",
           "const": "allow-passphrase-change",
@@ -463,12 +493,6 @@
           "type": "string",
           "const": "allow-preview-render",
           "markdownDescription": "Render sanitized preview HTML from Markdown text."
-        },
-        {
-          "description": "Search encrypted-index titles in memory.",
-          "type": "string",
-          "const": "allow-search-titles",
-          "markdownDescription": "Search encrypted-index titles in memory."
         },
         {
           "description": "Update the global theme, accent and auto-lock preferences.",

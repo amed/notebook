@@ -175,64 +175,6 @@ impl NotebookV1Codec {
             String::from_utf8(plaintext.to_vec()).map_err(|_| LegacyCodecError::InvalidUtf8)?;
         Ok(Zeroizing::new(text))
     }
-
-    /// Decodes listed S3 keys while keeping the configured prefix out of the
-    /// cipher. Keys encrypted with another phrase are reported but never shown
-    /// as misleading plaintext names.
-    pub fn decode_listing<'a>(
-        &self,
-        prefix: Option<&str>,
-        keys: impl IntoIterator<Item = &'a str>,
-    ) -> LegacyListing {
-        let normalized_prefix = prefix
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.trim_matches('/'));
-        let mut listing = LegacyListing::default();
-
-        for stored_key in keys {
-            let relative = match normalized_prefix {
-                Some(prefix) => stored_key
-                    .strip_prefix(prefix)
-                    .and_then(|rest| rest.strip_prefix('/')),
-                None => Some(stored_key.trim_matches('/')),
-            };
-            let Some(relative) = relative.filter(|value| !value.is_empty()) else {
-                continue;
-            };
-            match self.decode_path(relative) {
-                Ok(path)
-                    if path.ends_with(&format!("/{DIRECTORY_MARKER}"))
-                        || path == DIRECTORY_MARKER =>
-                {
-                    listing.directory_markers.push(path);
-                }
-                Ok(path) => listing.files.push(LegacyListedFile {
-                    logical_path: path,
-                    stored_key: stored_key.to_owned(),
-                }),
-                Err(_) => listing.undecodable += 1,
-            }
-        }
-        listing
-            .files
-            .sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
-        listing.directory_markers.sort();
-        listing
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LegacyListedFile {
-    pub logical_path: String,
-    pub stored_key: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LegacyListing {
-    pub files: Vec<LegacyListedFile>,
-    pub directory_markers: Vec<String>,
-    pub undecodable: usize,
 }
 
 fn derive_key(label: &[u8], phrase: &[u8]) -> [u8; 32] {
@@ -279,32 +221,6 @@ mod tests {
             codec.decode_path(&first).unwrap(),
             "projects/roadmap/todo.md"
         );
-    }
-
-    #[test]
-    fn fixture_listing_shows_decrypted_file_names() {
-        let fixture_codec = codec("fixture phrase");
-        let note_key = format!(
-            "my-prefix/{}",
-            fixture_codec.encode_path("notes/hello.md").unwrap()
-        );
-        let marker_key = format!(
-            "my-prefix/{}",
-            fixture_codec
-                .encode_path("empty-folder/.notebook_dir")
-                .unwrap()
-        );
-        let wrong_key = format!(
-            "my-prefix/{}",
-            codec("another phrase").encode_path("hidden.md").unwrap()
-        );
-        let listing = fixture_codec.decode_listing(
-            Some("my-prefix"),
-            [note_key.as_str(), marker_key.as_str(), wrong_key.as_str()],
-        );
-        assert_eq!(listing.files[0].logical_path, "notes/hello.md");
-        assert_eq!(listing.directory_markers, ["empty-folder/.notebook_dir"]);
-        assert_eq!(listing.undecodable, 1);
     }
 
     #[test]

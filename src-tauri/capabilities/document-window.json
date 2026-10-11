@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "document-window-capability",
+  "description": "Minimum permissions for a document window: its one document (Rust checks the holder), preview, its zoom (layout_set), links and the close guard",
+  "windows": ["doc-*"],
+  "permissions": [
+    "allow-document-window-info",
+    "allow-document-window-flushed",
+    "allow-activity-ping",
+    "allow-doc-open",
+    "allow-doc-stage",
+    "allow-doc-commit",
+    "allow-image-add",
+    "allow-preview-render",
+    "allow-layout-set",
+    "allow-link-open",
+    "allow-document-link-open",
+    "allow-close-after-flush",
+    "allow-cancel-close",
+    "allow-document-window-close",
+    "core:event:allow-listen"
+  ]
+}

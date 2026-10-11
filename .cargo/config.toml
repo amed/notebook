@@ -1,0 +1,18 @@
+# Read by every cargo run started in this repository or below it (the Tauri
+# CLI runs cargo in src-tauri; CI runs it here with --manifest-path). A
+# RUSTFLAGS environment variable replaces these flags (cargo's rule).
+
+# macOS release binaries are stripped by the linker (ld64 -S -x, see
+# src-tauri/build.rs). rustc's own strip step (profile `strip = true`) runs
+# rust-objcopy, which cannot load libLLVM.dylib unless cargo runs through a
+# rustup proxy; it then only warns and ships the binary unstripped (arm64
+# 9.49 MB instead of 6.76 MB). So rustc does not strip on macOS; Linux and
+# Windows keep it (there rustc strips at link time).
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "strip=none"]
+
+# Hardware AES and PMULL (ARMv8 Crypto Extensions) for aes 0.8 / polyval 0.6,
+# which otherwise run their software fallback on Apple silicon and ARM Linux.
+# Detected at runtime on macOS and Linux, with the software fallback kept.
+[target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))']
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

@@ -9,9 +9,9 @@ import {
   sameLayout,
 } from "./panel-layout";
 
-export type PanelHandleName = "sidebar" | "outline" | "split";
+type PanelHandleName = "sidebar" | "outline" | "split";
 
-export interface PanelResizerHost {
+interface PanelResizerHost {
   /**
    * The containers (and handles) whose own rules use --sidebar-width,
    * --outline-width and --split-ratio; each gets them on its own style, as
@@ -45,7 +45,7 @@ interface Drag {
  * The three resize handles (role="separator"). A drag writes the widths as
  * CSS custom properties on the layout containers at most once per animation frame,
  * computed from the pointer and window.innerWidth only, so a drag reads no
- * layout; Monaco follows through its own ResizeObserver (automaticLayout).
+ * layout; CodeMirror follows through its own ResizeObserver.
  * The pointer is captured, and a transparent overlay covers the window while
  * dragging, so the HTML preview's iframe never takes the drag.
  */

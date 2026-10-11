@@ -1,25 +1,31 @@
 //! Pane sizes: the sidebar and outline widths and the editor's share of
-//! Split, a global preference in `config.json` (`"layout"`). The frontend
-//! sends them once a drag ends (or 500 ms after the last resize key), never
-//! per pointer move; saving them touches no workspace, secret or S3 object.
+//! Split, and the preview zoom: global preferences in `config.json`
+//! (`"layout"`). The frontend sends the sizes once a drag ends (or 500 ms
+//! after the last resize key), never per pointer move, and the zoom 500 ms
+//! after its last change; each call carries only the values it changes, so
+//! a document window saving the zoom never resets the main window's sizes.
+//! Saving them touches no workspace, secret or S3 object.
 //!
-//! The ranges match `src/panel-layout.ts`. A config without the field, or with
-//! a value out of range or of the wrong type, gets the default for that value:
-//! a cosmetic preference never makes the file unreadable.
+//! The ranges match `src/panel-layout.ts` and `src/preview-zoom.ts`. A config
+//! without the field, or with a value out of range or of the wrong type, gets
+//! the default for that value: a cosmetic preference never makes the file
+//! unreadable.
 
 use super::*;
 
 pub(super) const SIDEBAR_WIDTH: (u32, u32) = (180, 480);
 pub(super) const OUTLINE_WIDTH: (u32, u32) = (180, 420);
 pub(super) const SPLIT_RATIO: (f64, f64) = (0.2, 0.8);
+pub(super) const PREVIEW_ZOOM: (u32, u32) = (50, 200);
 
 /// CSS pixels for the widths; the editor's fraction of the editor and
-/// preview in Split.
+/// preview in Split; the preview zoom in percent.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct PanelLayout {
     pub sidebar_width: u32,
     pub outline_width: u32,
     pub split_ratio: f64,
+    pub preview_zoom: u32,
 }
 
 impl Default for PanelLayout {
@@ -28,6 +34,27 @@ impl Default for PanelLayout {
             sidebar_width: 280,
             outline_width: 240,
             split_ratio: 0.5,
+            preview_zoom: 100,
+        }
+    }
+}
+
+/// `layout_set`'s arguments: the values to change.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct LayoutChange {
+    pub sidebar_width: Option<u32>,
+    pub outline_width: Option<u32>,
+    pub split_ratio: Option<f64>,
+    pub preview_zoom: Option<u32>,
+}
+
+impl LayoutChange {
+    fn applied_to(self, layout: PanelLayout) -> PanelLayout {
+        PanelLayout {
+            sidebar_width: self.sidebar_width.unwrap_or(layout.sidebar_width),
+            outline_width: self.outline_width.unwrap_or(layout.outline_width),
+            split_ratio: self.split_ratio.unwrap_or(layout.split_ratio),
+            preview_zoom: self.preview_zoom.unwrap_or(layout.preview_zoom),
         }
     }
 }
@@ -44,6 +71,10 @@ fn split_ok(ratio: f64) -> bool {
     ratio.is_finite() && (SPLIT_RATIO.0..=SPLIT_RATIO.1).contains(&ratio)
 }
 
+fn zoom_ok(percent: u32) -> bool {
+    (PREVIEW_ZOOM.0..=PREVIEW_ZOOM.1).contains(&percent)
+}
+
 pub(super) fn validate_layout(layout: &PanelLayout) -> Result<(), IpcError> {
     if !sidebar_ok(layout.sidebar_width) {
         return Err(IpcError::invalid(
@@ -58,6 +89,11 @@ pub(super) fn validate_layout(layout: &PanelLayout) -> Result<(), IpcError> {
     if !split_ok(layout.split_ratio) {
         return Err(IpcError::invalid(
             "The split ratio must be between 0.2 and 0.8.",
+        ));
+    }
+    if !zoom_ok(layout.preview_zoom) {
+        return Err(IpcError::invalid(
+            "The preview zoom must be between 50 and 200 percent.",
         ));
     }
     Ok(())
@@ -92,6 +128,9 @@ pub(super) fn parse_layout(raw: Option<&serde_json::Value>) -> (PanelLayout, boo
     if let Some(outline) = width("outline_width", outline_ok, &mut changed) {
         layout.outline_width = outline;
     }
+    if let Some(zoom) = width("preview_zoom", zoom_ok, &mut changed) {
+        layout.preview_zoom = zoom;
+    }
     if let Some(value) = object.get("split_ratio") {
         match value.as_f64().filter(|ratio| split_ok(*ratio)) {
             Some(ratio) => layout.split_ratio = ratio,
@@ -101,15 +140,16 @@ pub(super) fn parse_layout(raw: Option<&serde_json::Value>) -> (PanelLayout, boo
     (layout, changed)
 }
 
-/// Saves the pane sizes with the other global preferences (written durably,
-/// as `settings_set` does). It never touches a workspace, its credentials,
-/// the unlocked session or S3.
-pub(super) fn save_layout(state: &NotebookState, layout: PanelLayout) -> Result<(), IpcError> {
-    validate_layout(&layout)?;
+/// Saves the values in `change` with the other global preferences (written
+/// durably, as `settings_set` does); the values not given stay. It never
+/// touches a workspace, its credentials, the unlocked session or S3.
+pub(super) fn save_layout(state: &NotebookState, change: LayoutChange) -> Result<(), IpcError> {
+    validate_layout(&change.applied_to(PanelLayout::default()))?;
     let mut inner = state
         .inner
         .lock()
         .map_err(|_| IpcError::internal("STATE"))?;
+    let layout = change.applied_to(inner.app.layout);
     if inner.app.layout == layout {
         return Ok(());
     }
@@ -120,20 +160,22 @@ pub(super) fn save_layout(state: &NotebookState, layout: PanelLayout) -> Result<
     Ok(())
 }
 
-/// `layout_set({ sidebar_width, outline_width, split_ratio })`.
+/// `layout_set({ sidebar_width?, outline_width?, split_ratio?, preview_zoom? })`.
 #[tauri::command(rename_all = "snake_case")]
 pub fn layout_set(
     state: State<'_, NotebookState>,
-    sidebar_width: u32,
-    outline_width: u32,
-    split_ratio: f64,
+    sidebar_width: Option<u32>,
+    outline_width: Option<u32>,
+    split_ratio: Option<f64>,
+    preview_zoom: Option<u32>,
 ) -> Result<(), IpcError> {
     save_layout(
         &state,
-        PanelLayout {
+        LayoutChange {
             sidebar_width,
             outline_width,
             split_ratio,
+            preview_zoom,
         },
     )
 }
@@ -156,6 +198,24 @@ mod tests {
             sidebar_width,
             outline_width,
             split_ratio,
+            preview_zoom: 100,
+        }
+    }
+
+    /// The pane sizes, as the main window sends them after a drag.
+    fn sizes(layout: PanelLayout) -> LayoutChange {
+        LayoutChange {
+            sidebar_width: Some(layout.sidebar_width),
+            outline_width: Some(layout.outline_width),
+            split_ratio: Some(layout.split_ratio),
+            preview_zoom: None,
+        }
+    }
+
+    fn zoom(percent: u32) -> LayoutChange {
+        LayoutChange {
+            preview_zoom: Some(percent),
+            ..LayoutChange::default()
         }
     }
 
@@ -178,12 +238,27 @@ mod tests {
             layout(280, 240, 0.81),
             layout(280, 240, f64::NAN),
             layout(280, 240, f64::INFINITY),
+            PanelLayout {
+                preview_zoom: 49,
+                ..PanelLayout::default()
+            },
+            PanelLayout {
+                preview_zoom: 201,
+                ..PanelLayout::default()
+            },
         ] {
             assert_eq!(
                 validate_layout(&bad).unwrap_err().code(),
                 "INVALID_INPUT",
                 "{bad:?}"
             );
+        }
+        for good in [50, 67, 100, 175, 200] {
+            let zoomed = PanelLayout {
+                preview_zoom: good,
+                ..PanelLayout::default()
+            };
+            assert!(validate_layout(&zoomed).is_ok(), "{good}");
         }
     }
 
@@ -210,6 +285,13 @@ mod tests {
             (PanelLayout::default(), true)
         );
         assert_eq!(parse(r#""narrow""#), (PanelLayout::default(), true));
+        let zoomed = |preview_zoom| PanelLayout {
+            preview_zoom,
+            ..PanelLayout::default()
+        };
+        assert_eq!(parse(r#"{"preview_zoom":150}"#), (zoomed(150), false));
+        assert_eq!(parse(r#"{"preview_zoom":20}"#), (zoomed(100), true));
+        assert_eq!(parse(r#"{"preview_zoom":1.5}"#), (zoomed(100), true));
     }
 
     #[test]
@@ -229,13 +311,16 @@ mod tests {
             PanelLayout::default()
         );
 
-        let wanted = layout(344, 212, 0.6375);
-        save_layout(&state, wanted).unwrap();
+        let mut wanted = layout(344, 212, 0.6375);
+        save_layout(&state, sizes(wanted)).unwrap();
+        // The zoom alone (a document window, say) keeps the sizes.
+        save_layout(&state, zoom(125)).unwrap();
+        wanted.preview_zoom = 125;
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
         assert_eq!(
             saved["layout"],
-            serde_json::json!({ "sidebar_width": 344, "outline_width": 212, "split_ratio": 0.6375 })
+            serde_json::json!({ "sidebar_width": 344, "outline_width": 212, "split_ratio": 0.6375, "preview_zoom": 125 })
         );
         assert_eq!(saved["theme"], "Dark");
         assert_eq!(saved["accent"], "teal");
@@ -243,7 +328,8 @@ mod tests {
 
         // A rejected value changes neither the state nor the file.
         let before = std::fs::read(&config).unwrap();
-        assert!(save_layout(&state, layout(100, 212, 0.5)).is_err());
+        assert!(save_layout(&state, sizes(layout(100, 212, 0.5))).is_err());
+        assert!(save_layout(&state, zoom(300)).is_err());
         assert_eq!(std::fs::read(&config).unwrap(), before);
         assert_eq!(state.lock_inner().unwrap().app.layout, wanted);
 
@@ -256,7 +342,7 @@ mod tests {
             serde_json::to_value(workspaces::config_view(&again.lock_inner().unwrap())).unwrap();
         assert_eq!(
             view["layout"],
-            serde_json::json!({ "sidebar_width": 344, "outline_width": 212, "split_ratio": 0.6375 })
+            serde_json::json!({ "sidebar_width": 344, "outline_width": 212, "split_ratio": 0.6375, "preview_zoom": 125 })
         );
     }
 }

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-pub mod compat;
+mod compat;
 mod deleted_items;
 mod hardening;
 mod links;
@@ -40,7 +40,12 @@ pub fn run() {
                         notebook::IdleAction::Notify => false,
                         notebook::IdleAction::Forced => true,
                     };
-                    let _ = handle.emit("auto-lock", forced);
+                    let _ = handle.emit_to(notebook::MAIN_WINDOW, "auto-lock", forced);
+                    // The backend ended the session: its document windows go too.
+                    if forced {
+                        window::reset_main_title(&handle);
+                        window::close_stale_document_windows(&handle);
+                    }
                 }
             });
             Ok(())

@@ -3,7 +3,7 @@
 //! and TCP connections and can hang ("blackhole") or reset connections.
 
 use notebook_app::notebook::testing::Workspace;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -23,15 +23,33 @@ enum Fault {
     Reset,
 }
 
+/// How the fake answers DeleteObjects.
+#[derive(Clone, Copy, PartialEq)]
+enum Batch {
+    /// Deletes the keys, if the request has the shape the AWS SDKs send.
+    Accept,
+    /// 403 AccessDenied for the whole request, as AWS answered the user's
+    /// app; single DeleteObject requests still pass.
+    Refuse,
+    /// 200 with an AccessDenied `<Error>` for every key, deleting nothing.
+    DenyEachKey,
+}
+
 struct Shared {
     objects: Mutex<BTreeMap<String, (Vec<u8>, String)>>,
+    batch: Mutex<Batch>,
     requests: Mutex<Vec<&'static str>>,
     connections: AtomicUsize,
+    /// Requests being answered now, and the most at once since the reset.
+    in_flight: AtomicUsize,
+    most_in_flight: AtomicUsize,
     versions: AtomicU64,
     fault: Mutex<Fault>,
     delay: Mutex<Duration>,
     /// A listing reads the objects at once but answers this much later.
     slow_list: Mutex<Duration>,
+    /// Keys whose single DeleteObject answers 400 InvalidRequest.
+    failing_deletes: Mutex<BTreeSet<String>>,
 }
 
 struct FakeS3 {
@@ -45,12 +63,16 @@ impl FakeS3 {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let shared = Arc::new(Shared {
             objects: Mutex::default(),
+            batch: Mutex::new(Batch::Accept),
             requests: Mutex::default(),
             connections: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            most_in_flight: AtomicUsize::new(0),
             versions: AtomicU64::new(0),
             fault: Mutex::new(Fault::None),
             delay: Mutex::new(Duration::ZERO),
             slow_list: Mutex::new(Duration::ZERO),
+            failing_deletes: Mutex::default(),
         });
         let server = shared.clone();
         std::thread::spawn(move || {
@@ -71,6 +93,12 @@ impl FakeS3 {
     fn reset_counts(&self) {
         self.shared.requests.lock().unwrap().clear();
         self.shared.connections.store(0, Ordering::SeqCst);
+        self.shared.most_in_flight.store(0, Ordering::SeqCst);
+    }
+
+    /// The most requests S3 answered at once since the last reset.
+    fn most_in_flight(&self) -> usize {
+        self.shared.most_in_flight.load(Ordering::SeqCst)
     }
 
     fn requests(&self) -> Vec<&'static str> {
@@ -83,6 +111,26 @@ impl FakeS3 {
 
     fn set_fault(&self, fault: Fault) {
         *self.shared.fault.lock().unwrap() = fault;
+    }
+
+    fn set_batch(&self, batch: Batch) {
+        *self.shared.batch.lock().unwrap() = batch;
+    }
+
+    /// Single deletes of these keys fail from now on (none: all pass again).
+    fn fail_single_deletes(&self, keys: BTreeSet<String>) {
+        *self.shared.failing_deletes.lock().unwrap() = keys;
+    }
+
+    /// The keys in the bucket now.
+    fn keys(&self) -> BTreeSet<String> {
+        self.shared
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn set_delay(&self, delay: Duration) {
@@ -159,8 +207,11 @@ fn serve(shared: &Shared, stream: TcpStream) {
             }
             Fault::None => {}
         }
+        let now = shared.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        shared.most_in_flight.fetch_max(now, Ordering::SeqCst);
         std::thread::sleep(*shared.delay.lock().unwrap());
         let (status, etag, reply) = handle(shared, &method, &target, &headers, body);
+        shared.in_flight.fetch_sub(1, Ordering::SeqCst);
         if target.contains("list-type") {
             std::thread::sleep(*shared.slow_list.lock().unwrap());
         }
@@ -234,8 +285,13 @@ fn handle(
     let if_match = headers.get("if-match");
     if method == "POST" && params.contains_key("delete") {
         log("DELETE_OBJECTS");
-        // S3 refuses a DeleteObjects request without Content-MD5.
-        if !headers.contains_key("content-md5") {
+        // S3 refuses a DeleteObjects request without Content-MD5. The fake
+        // also wants what the AWS SDKs send: `?delete` without a value, and
+        // Content-MD5 signed.
+        let signed = params
+            .get("X-Amz-SignedHeaders")
+            .is_some_and(|names| names.split(';').any(|name| name == "content-md5"));
+        if !headers.contains_key("content-md5") || !params["delete"].is_empty() || !signed {
             return (
                 400,
                 None,
@@ -243,11 +299,35 @@ fn handle(
             );
         }
         let body = String::from_utf8(body).unwrap();
-        for part in body.split("<Key>").skip(1) {
-            let key = part.split("</Key>").next().unwrap().replace("&amp;", "&");
-            objects.remove(&key);
-        }
-        return (200, None, b"<DeleteResult></DeleteResult>".to_vec());
+        let keys = body
+            .split("<Key>")
+            .skip(1)
+            .map(|part| part.split("</Key>").next().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        return match *shared.batch.lock().unwrap() {
+            Batch::Refuse => (
+                403,
+                None,
+                b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+                    .to_vec(),
+            ),
+            Batch::DenyEachKey => {
+                let mut xml = String::from("<DeleteResult>");
+                for key in keys {
+                    xml.push_str(&format!(
+                        "<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+                    ));
+                }
+                xml.push_str("</DeleteResult>");
+                (200, None, xml.into_bytes())
+            }
+            Batch::Accept => {
+                for key in keys {
+                    objects.remove(&key.replace("&amp;", "&"));
+                }
+                (200, None, b"<DeleteResult></DeleteResult>".to_vec())
+            }
+        };
     }
     if method == "PUT"
         && let Some(source) = headers.get("x-amz-copy-source")
@@ -303,6 +383,13 @@ fn handle(
         }
         "DELETE" => {
             log("DELETE");
+            if shared.failing_deletes.lock().unwrap().contains(&key) {
+                return (
+                    400,
+                    None,
+                    b"<Error><Code>InvalidRequest</Code></Error>".to_vec(),
+                );
+            }
             if if_match.is_some_and(|etag| current_etag.as_ref() != Some(etag)) {
                 return (412, None, Vec::new());
             }
@@ -920,4 +1007,370 @@ async fn a_slow_upload_of_one_workspace_never_writes_into_another() {
     );
     assert_eq!(read_fresh(&a, "a.md").await, "edit in A");
     assert_eq!(read_fresh(&b, "a.md").await, "edit in B");
+}
+
+/// The S3 keys of the bin entry holding `name`, from the session's map.
+fn entry_keys(app: &Workspace, name: &str) -> BTreeSet<String> {
+    let objects = app
+        .objects()
+        .into_iter()
+        .zip(app.stored_keys())
+        .collect::<Vec<_>>();
+    let item = format!("item/{name}");
+    let container = objects
+        .iter()
+        .find_map(|(path, _)| {
+            let (id, inner) = path.strip_prefix("_deleted/items/")?.split_once('/')?;
+            (inner == item || inner.starts_with(&format!("{item}/")))
+                .then(|| format!("_deleted/items/{id}/"))
+        })
+        .unwrap();
+    objects
+        .into_iter()
+        .filter(|(path, _)| path.starts_with(&container))
+        .map(|(_, key)| key)
+        .collect()
+}
+
+fn trash_key(app: &Workspace, name: &str) -> String {
+    app.trash_items()
+        .into_iter()
+        .find(|item| item.name == name)
+        .unwrap()
+        .key
+}
+
+/// Runs `action` and returns its requests by kind and the keys it removed
+/// (requests without PUT or COPY add none).
+async fn deletes_of<F: std::future::Future>(
+    s3: &FakeS3,
+    action: F,
+) -> (BTreeMap<&'static str, usize>, BTreeSet<String>) {
+    let before = s3.keys();
+    let counts = requests_of(s3, action).await;
+    let after = s3.keys();
+    (counts, before.difference(&after).cloned().collect())
+}
+
+/// AWS answered the user's DeleteObjects with 403 while single deletes
+/// passed. Delete permanently and Empty Trash still remove exactly the
+/// objects of the chosen entries: the first purge pays one refused batch,
+/// later ones in the session go straight to single deletes, 8 at a time.
+#[tokio::test]
+async fn a_refused_delete_objects_falls_back_to_single_deletes() {
+    let (s3, directory) = seeded_vault().await;
+    s3.set_batch(Batch::Refuse);
+    let app = s3.workspace(directory.path());
+    app.unlock(PHRASE).await.unwrap();
+    for path in ["a.md", "b.md", "c.md", "Projects"] {
+        app.trash(path).await.unwrap();
+    }
+    let wanted = entry_keys(&app, "b.md");
+    let (requests, removed) = deletes_of(&s3, async {
+        app.purge(&trash_key(&app, "b.md")).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        requests,
+        counts(&[("DELETE_OBJECTS", 1), ("DELETE", wanted.len())]),
+        "refused batch, then one delete per object"
+    );
+    assert_eq!(removed, wanted, "exactly the entry's objects");
+    let wanted = entry_keys(&app, "Projects");
+    assert!(wanted.len() > 8);
+    let (requests, removed) = deletes_of(&s3, async {
+        app.purge(&trash_key(&app, "Projects")).await.unwrap();
+    })
+    .await;
+    assert_eq!(
+        requests,
+        counts(&[("DELETE", wanted.len())]),
+        "the session remembers: no batch"
+    );
+    assert_eq!(removed, wanted);
+    assert!(s3.most_in_flight() <= 8, "at most 8 deletes at once");
+    let wanted = &entry_keys(&app, "a.md") | &entry_keys(&app, "c.md");
+    let (requests, removed) = deletes_of(&s3, async { app.empty().await.unwrap() }).await;
+    assert_eq!(requests, counts(&[("DELETE", wanted.len())]), "Empty Trash");
+    assert_eq!(removed, wanted);
+    assert!(app.trash_items().is_empty());
+    assert!(app.matches_listing().await.unwrap());
+    // A new session tries DeleteObjects again.
+    s3.set_batch(Batch::Accept);
+    app.lock();
+    app.unlock(PHRASE).await.unwrap();
+    app.trash("d.md").await.unwrap();
+    let wanted = entry_keys(&app, "d.md");
+    let (requests, removed) = deletes_of(&s3, async {
+        app.purge(&trash_key(&app, "d.md")).await.unwrap();
+    })
+    .await;
+    assert_eq!(requests, counts(&[("DELETE_OBJECTS", 1)]), "batch accepted");
+    assert_eq!(removed, wanted);
+    assert!(app.matches_listing().await.unwrap());
+}
+
+/// A DeleteObjects that answers 200 but reports AccessDenied for every key
+/// deleted nothing: those keys go one by one, and the session stops batching.
+/// Restore's cleanup of the bin container takes the same path.
+#[tokio::test]
+async fn per_key_access_denied_falls_back_to_single_deletes() {
+    let (s3, directory) = seeded_vault().await;
+    s3.set_batch(Batch::DenyEachKey);
+    let app = s3.workspace(directory.path());
+    app.unlock(PHRASE).await.unwrap();
+    for path in ["a.md", "b.md", "c.md"] {
+        app.trash(path).await.unwrap();
+    }
+    let wanted = entry_keys(&app, "a.md");
+    let (requests, removed) = deletes_of(&s3, async {
+        assert_eq!(app.restore(&trash_key(&app, "a.md")).await.unwrap(), "a.md");
+    })
+    .await;
+    assert_eq!(
+        requests,
+        counts(&[
+            ("LIST", 1),
+            ("COPY", 1),
+            ("DELETE_OBJECTS", 1),
+            ("DELETE", wanted.len())
+        ]),
+        "restore: the container goes one object at a time"
+    );
+    assert_eq!(removed, wanted);
+    let wanted = entry_keys(&app, "b.md");
+    let (requests, removed) = deletes_of(&s3, async {
+        app.purge(&trash_key(&app, "b.md")).await.unwrap();
+    })
+    .await;
+    assert_eq!(requests, counts(&[("DELETE", wanted.len())]), "purge");
+    assert_eq!(removed, wanted);
+    let wanted = entry_keys(&app, "c.md");
+    let (requests, removed) = deletes_of(&s3, async { app.empty().await.unwrap() }).await;
+    assert_eq!(requests, counts(&[("DELETE", wanted.len())]), "Empty Trash");
+    assert_eq!(removed, wanted);
+    assert!(app.trash_items().is_empty());
+    assert!(app.matches_listing().await.unwrap());
+    assert_eq!(app.read("a.md").await.unwrap(), "a.md");
+}
+
+/// The S3 key of `inner` (such as "item/.notebook_dir") in the bin entry
+/// holding `name`.
+fn entry_object_key(app: &Workspace, name: &str, inner: &str) -> String {
+    let objects = app
+        .objects()
+        .into_iter()
+        .zip(app.stored_keys())
+        .collect::<Vec<_>>();
+    let item = format!("item/{name}");
+    let container = objects
+        .iter()
+        .find_map(|(path, _)| {
+            let (id, rest) = path.strip_prefix("_deleted/items/")?.split_once('/')?;
+            (rest == item || rest.starts_with(&format!("{item}/")))
+                .then(|| format!("_deleted/items/{id}/"))
+        })
+        .unwrap();
+    let wanted = format!("{container}{inner}");
+    objects
+        .into_iter()
+        .find(|(path, _)| *path == wanted)
+        .unwrap()
+        .1
+}
+
+/// Single deletes take a bin entry's markers before its item. When a marker
+/// cannot be deleted, the item stays, so the entry stays in Trash and a
+/// retry removes exactly what is left; other entries are not held back.
+/// When the item cannot be deleted, the entry stays listed as well.
+#[tokio::test]
+async fn a_failed_single_delete_keeps_the_entry_for_a_retry() {
+    let (s3, directory) = seeded_vault().await;
+    s3.set_batch(Batch::Refuse);
+    let app = s3.workspace(directory.path());
+    app.unlock(PHRASE).await.unwrap();
+    for path in ["a.md", "Projects"] {
+        app.trash(path).await.unwrap();
+    }
+    let marker = entry_object_key(&app, "Projects", "item/.notebook_dir");
+    s3.fail_single_deletes(BTreeSet::from([marker]));
+    let projects = entry_keys(&app, "Projects");
+    let a = entry_keys(&app, "a.md");
+    let (requests, removed) = deletes_of(&s3, async {
+        assert_eq!(app.empty().await.unwrap_err().code(), "S3_REJECTED");
+    })
+    .await;
+    assert_eq!(
+        requests,
+        counts(&[("DELETE_OBJECTS", 1), ("DELETE", 3)]),
+        "refused batch, both markers, then only a.md's item"
+    );
+    assert_eq!(removed, a, "a.md is gone, nothing of Projects");
+    let names = app
+        .trash_items()
+        .into_iter()
+        .map(|item| item.name)
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["Projects"], "Projects stays in Trash");
+    assert!(app.matches_listing().await.unwrap());
+    s3.fail_single_deletes(BTreeSet::new());
+    let (requests, removed) = deletes_of(&s3, async {
+        app.purge(&trash_key(&app, "Projects")).await.unwrap();
+    })
+    .await;
+    assert_eq!(requests, counts(&[("DELETE", projects.len())]), "retry");
+    assert_eq!(removed, projects, "exactly what was left");
+    // A failed item delete: the marker goes, the item and the entry stay.
+    app.trash("b.md").await.unwrap();
+    let b = entry_keys(&app, "b.md");
+    let item = entry_object_key(&app, "b.md", "item/b.md");
+    s3.fail_single_deletes(BTreeSet::from([item.clone()]));
+    let (requests, removed) = deletes_of(&s3, async {
+        assert!(app.purge(&trash_key(&app, "b.md")).await.is_err());
+    })
+    .await;
+    assert_eq!(requests, counts(&[("DELETE", b.len())]));
+    assert_eq!(removed, &b - &BTreeSet::from([item]));
+    assert_eq!(app.trash_items().len(), 1, "b.md stays in Trash");
+    s3.fail_single_deletes(BTreeSet::new());
+    app.purge(&trash_key(&app, "b.md")).await.unwrap();
+    assert!(app.trash_items().is_empty());
+    assert!(s3.keys().is_disjoint(&b));
+    assert!(app.matches_listing().await.unwrap());
+}
+
+/// A dropped folder, as the sidebar imports it: the folders level by level,
+/// then the documents, several at once. One PUT per folder and document, no
+/// listing; a taken top-level name gets a number instead of merging.
+#[tokio::test]
+async fn importing_a_dropped_folder_costs_one_put_per_item() {
+    let (s3, directory) = seeded_vault().await;
+    let app = s3.workspace(directory.path());
+    app.unlock(PHRASE).await.unwrap();
+    let requests = requests_of(&s3, async {
+        assert_eq!(
+            app.create_folder("", "projects").await.unwrap(),
+            "projects 2"
+        );
+        let (north, south) = tokio::join!(
+            app.create_folder("projects 2", "north"),
+            app.create_folder("projects 2", "south")
+        );
+        assert_eq!(
+            (north.unwrap(), south.unwrap()),
+            ("north".into(), "south".into())
+        );
+        let (a, b, c, d) = tokio::join!(
+            app.create_document("projects 2", "README.md", "readme"),
+            app.create_document("projects 2/north", "a.md", "a"),
+            app.create_document("projects 2/north", "b.md", "b"),
+            app.create_document("projects 2/south", "c.md", "c"),
+        );
+        for created in [a, b, c, d] {
+            created.unwrap();
+        }
+    })
+    .await;
+    assert_eq!(requests, counts(&[("PUT", 7)]), "3 folders and 4 documents");
+    assert_eq!(app.read("projects 2/north/b.md").await.unwrap(), "b");
+    assert!(app.matches_listing().await.unwrap());
+}
+
+/// Spec E: the document window "doc-w" writes `a.md` and saves an edit
+/// after another device changed it. With `main_reads`, the main window shows
+/// the document again (read-only) after a Refresh saw the other version.
+async fn writer_after_another_device(main_reads: bool) -> (&'static str, String) {
+    let (s3, directory) = seeded().await;
+    let app = s3.workspace(&directory.path().join("app"));
+    app.unlock(PHRASE).await.unwrap();
+    assert_eq!(app.open("a.md").await.unwrap().0, "alpha");
+    app.hold_as("doc-w", "a.md").unwrap();
+    let (text, _, read_only) = app.open_as("a.md", "doc-w").await.unwrap();
+    assert_eq!((text.as_str(), read_only), ("alpha", false));
+    s3.write_elsewhere("a.md", "theirs").await;
+    app.refresh().await.unwrap();
+    if main_reads {
+        let (text, _, read_only) = app.open_as("a.md", "main").await.unwrap();
+        assert_eq!((text.as_str(), read_only), ("theirs", true));
+    }
+    // The window still shows "alpha" and saves its edit of it.
+    app.stage_as("a.md", "alpha, edited in the window", "doc-w")
+        .unwrap();
+    let status = app.commit_as("a.md", "doc-w").await.unwrap();
+    (status, read_fresh(&s3, "a.md").await)
+}
+
+#[tokio::test]
+async fn a_document_window_edit_of_an_old_version_becomes_a_conflict_copy() {
+    let (status, remote) = writer_after_another_device(false).await;
+    assert_eq!((status, remote.as_str()), ("ConflictCopy", "theirs"));
+}
+
+/// The main window's read-only open must not move the writer's base (its
+/// If-Match): the other device's version is kept, not overwritten.
+#[tokio::test]
+async fn a_read_only_open_in_main_never_lets_the_writer_overwrite_another_device() {
+    let (status, remote) = writer_after_another_device(true).await;
+    assert_eq!((status, remote.as_str()), ("ConflictCopy", "theirs"));
+}
+
+/// The document window keeps typing while main renames its document: an
+/// edit it stages during the S3 copy is refused (BUSY, kept in the window)
+/// instead of being dropped with the old key, and is saved under the new id.
+#[tokio::test]
+async fn an_edit_staged_by_a_document_window_during_a_rename_is_kept() {
+    let (s3, directory) = seeded().await;
+    let app = s3.workspace(&directory.path().join("app"));
+    app.unlock(PHRASE).await.unwrap();
+    app.open("a.md").await.unwrap();
+    app.hold_as("doc-w", "a.md").unwrap();
+    app.open_as("a.md", "doc-w").await.unwrap();
+    // What the window wrote when Rust asked (flush_document_windows).
+    app.stage_as("a.md", "flushed", "doc-w").unwrap();
+    s3.set_delay(Duration::from_millis(300));
+    let typing = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        app.stage_as("a.md", "typed during the rename", "doc-w")
+    };
+    let (renamed, staged) = tokio::join!(app.rename("a.md", "c.md"), typing);
+    s3.set_delay(Duration::ZERO);
+    renamed.unwrap();
+    assert_eq!(staged.map_err(|error| error.code()), Err("BUSY"));
+    assert_eq!(read_fresh(&s3, "c.md").await, "flushed");
+    // The window keeps the refused edit and writes it under the new id.
+    assert_eq!(
+        app.stage_as("c.md", "typed during the rename", "doc-w")
+            .unwrap(),
+        "Staged"
+    );
+    assert_eq!(app.commit_as("c.md", "doc-w").await.unwrap(), "Saved");
+    assert_eq!(
+        (read_fresh(&s3, "c.md").await, app.outbox_entries()),
+        ("typed during the rename".to_owned(), 0)
+    );
+}
+
+/// Trash: what the window wrote before is in the trashed document; nothing
+/// staged during the move is left in the outbox for a key that is gone.
+#[tokio::test]
+async fn a_document_window_cannot_stage_while_its_document_moves_to_the_trash() {
+    let (s3, directory) = seeded().await;
+    let app = s3.workspace(&directory.path().join("app"));
+    app.unlock(PHRASE).await.unwrap();
+    app.open("a.md").await.unwrap();
+    app.hold_as("doc-w", "a.md").unwrap();
+    app.open_as("a.md", "doc-w").await.unwrap();
+    app.stage_as("a.md", "flushed", "doc-w").unwrap();
+    s3.set_delay(Duration::from_millis(300));
+    let typing = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        app.stage_as("a.md", "typed during the trash", "doc-w")
+    };
+    let (trashed, staged) = tokio::join!(app.trash("a.md"), typing);
+    s3.set_delay(Duration::ZERO);
+    let entry = trashed.unwrap();
+    assert_eq!(staged.map_err(|error| error.code()), Err("BUSY"));
+    assert_eq!(app.outbox_entries(), 0);
+    let restored = app.restore(&entry).await.unwrap();
+    assert_eq!(app.read(&restored).await.unwrap(), "flushed");
 }

@@ -22,22 +22,20 @@ path = "src/main.rs"
 tauri-build = { version = "2.5.1", default-features = false, features = ["config-json5"] }
 
 [dependencies]
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "getrandom"] }
 aes-gcm-siv = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "getrandom"] }
 ammonia = { version = "4.1.2", default-features = false }
-argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash", "rand"] }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-bytes = { version = "1.10.1", default-features = false, features = ["serde"] }
 getrandom = { version = "0.3.3", default-features = false }
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
-hkdf = { version = "0.12.4", default-features = false }
-hmac = { version = "0.12.1", default-features = false }
+# The clock rusty-s3 signs with, for the one request it cannot shape itself
+# (DeleteObjects as AWS documents it). Already in the graph through rusty-s3.
+jiff = { version = "0.2.37", default-features = false, features = ["std"] }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 pbkdf2 = { version = "0.12.2", default-features = false, features = ["hmac"] }
 pulldown-cmark = { version = "0.13.0", default-features = false, features = ["html"] }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls", "system-proxy"] }
 rusty-s3 = { version = "0.10.1", default-features = false, features = ["full", "rustcrypto"] }
-secrecy = { version = "0.10.3", default-features = false, features = ["serde"] }
+secrecy = { version = "0.10.3", default-features = false }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.143", default-features = false, features = ["std"] }
 sha2 = { version = "0.10.9", default-features = false }
@@ -45,11 +43,11 @@ tauri = { version = "2.12.0", default-features = false, features = ["wry", "comm
 tauri-plugin-opener = { version = "2.7.0", default-features = false }
 thiserror = { version = "2.0.16", default-features = false }
 tokio = { version = "1.47.1", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
-tracing = { version = "0.1.41", default-features = false, features = ["attributes", "std"] }
+tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "smallvec"] }
 unicode-normalization = "0.1.24"
-url = { version = "2.5.7", default-features = false, features = ["serde"] }
-uuid = { version = "1.18.1", default-features = false, features = ["v4", "serde", "std"] }
+url = { version = "2.5.7", default-features = false }
+uuid = { version = "1.18.1", default-features = false, features = ["v4", "std"] }
 zeroize = { version = "1.8.1", default-features = false, features = ["alloc", "derive", "serde"] }
 
 # Best-effort process hygiene (spec section 11): core-dump limit on Unix and the
@@ -65,15 +63,25 @@ rustix = { version = "1.1.5", default-features = false, features = ["process", "
 proptest = { version = "1.7.0", default-features = false, features = ["std"] }
 tempfile = "3.21.0"
 
+# Measured on the arm64 binary (2026-10-05, scratchpad bench): "s" 6.76 MB;
+# "z" 5.45 MB but the 1 MB preview render 39 -> 107 ms; 3 is 8.31 MB for a
+# 15% faster render. "s" with SHA-256 at 3 (12 MB digest 48 -> 21 ms, no
+# size change) and hardware AES (../.cargo/config.toml) is kept.
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
+# Linux and Windows: rustc strips at link time. macOS: the linker does, see
+# build.rs and ../.cargo/config.toml.
 strip = true
 panic = "abort"
 
-[profile.release.package.argon2]
-opt-level = 3
+# Build scripts and proc macros run once on the build machine and are never
+# shipped: no strip step for them (on macOS that step needs rust-objcopy).
+[profile.release.build-override]
+strip = false
 
-[profile.release.package.aes-gcm]
+# SHA-256 runs PBKDF2 at unlock (3 x 120,000 rounds) and digests every
+# staged and opened text: unlock -100 ms, 12 MB digest 48 -> 21 ms.
+[profile.release.package.sha2]
 opt-level = 3

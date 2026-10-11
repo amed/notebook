@@ -4,44 +4,23 @@ This file records places where the build specification is silent, internally
 inconsistent, or requires an owner decision. Security and data safety take
 precedence.
 
-## Experimental native format (not active for S3 interoperability)
+## Names
 
-The following SMDV envelope decisions are retained for a possible future vault
-type. The current app does not write this format; the primary format is the
-Notebook-compatible format described below.
-
-- The vault-key wrap authenticates a canonical **pre-wrap header**, because the
-  complete stored header contains the wrap ciphertext and therefore cannot be
-  its own associated data. The pre-wrap header contains `vault_id`, `created`
-  and `kdf`, serialized as compact JSON with struct field order. The stored
-  `wrap` object contains base64url-without-padding nonce and ciphertext.
-- Envelope associated data is unambiguous binary:
-  `SMDV || 0x01 || vault_uuid(16) || object_uuid(16) || kind(1)`.
-- The index-body object ID is the vault ID. Header JSON is capped at 64 KiB,
-  the decrypted index at 50 MiB, documents at 50 MiB, and images at 20 MiB.
-- Integers in the binary index prefix are little-endian as specified. JSON is
-  UTF-8 and compact on upload. Readers do not depend on JSON field order.
-
-## Unicode and names
-
-`unicode-normalization` is the one required dependency not named in the stack
-table. Rust's standard library has no NFC implementation. Names are NFC,
-trimmed, limited to 255 Unicode scalar values, reject `/` and controls, and are
-compared with Unicode lowercase mapping. Suffix generation truncates safely at
-a scalar boundary so the result remains within 255 characters.
+`validate_name` (notebook.rs) trims a name and refuses an empty one, one over
+255 bytes, `/`, `\`, NUL and control characters, `.`, `..`, `.notebook_dir`
+and the Trash names. Names are not NFC-normalized; siblings are compared with
+Unicode lowercase mapping. `unicode-normalization` (Rust's standard library
+has no NFC) is used only for heading slugs.
 
 ## Setup and credentials
 
-- A 403 response without `s3:ListBucket` cannot distinguish a missing index
-  from denied access. `connection_test` reports `AccessDenied`; vault creation
-  remains available only as an explicit, conditional `If-None-Match: *` action,
-  which can never overwrite a vault.
-- Superseded by "Workspaces and remembered phrase" below: credentials are
-  sealed in `secrets.json` per workspace id. The keychain account derived from
-  the bucket and prefix tuple is only read once, to migrate an earlier build.
+- Credentials are sealed in `secrets.json` per workspace id (see "Workspaces
+  and remembered phrase"). The keychain item of builds before workspaces is
+  read once, to migrate it.
 - v1 officially supports AWS S3. Endpoint override exists for testing and
   compatible providers, but those providers are not certified. Non-HTTPS
-  endpoints are accepted only in debug/test builds and only for loopback hosts.
+  endpoints are accepted only in debug builds and only for `localhost` and
+  `127.0.0.1`.
 
 ## Product behavior
 
@@ -65,8 +44,10 @@ a scalar boundary so the result remains within 255 characters.
     `on*`/`autofocus`/`target`/`download` attributes and every URL except
     `#id`, `data:` raster images and web/mail links. SVG, MathML, `noscript`,
     forms (inert) and inline CSS stay.
-  - Removed scripts are counted; the pane then shows "Scripts are off in the
-    preview (N not run)." instead of a silently blank page.
+  - Removed scripts are counted; the status bar then shows "Scripts off (N)"
+    (with a tooltip) instead of a silently blank page. The pane itself never
+    carries the note (2026-10-05), and focus mode and document windows,
+    which hide the status bar, show none.
   - Web and mail links become `preview.html?open=<url>`. The app CSP
     (`frame-src 'self'`) blocks any other frame destination before the Rust
     guard sees it, and the page cannot run script, so the click reloads the
@@ -78,25 +59,25 @@ a scalar boundary so the result remains within 255 characters.
     starts at the top. Edit mode keeps the hidden frame (except for documents
     over 512 KB, see "Fewer UI changes"). Every frame `load` repaints, so a
     frame that is navigated anywhere heals itself.
-- Rust owns the canonical plaintext, but the currently visible Monaco model
-  necessarily contains an ephemeral JavaScript string. Lock writes the open
+- Rust owns the canonical plaintext, but the editor's document states
+  necessarily contain ephemeral JavaScript strings. Lock writes the open
   document's edit to the outbox, gives the uploads 3 s, calls `vault_lock`
-  (see "Save model"), disposes every model and
-  the editor, drops the page's decrypted names and texts (tree, sample cache,
+  (see "Save model"), destroys the editor with every kept document state, drops the page's decrypted names and texts (tree, sample cache,
   search, open dialogs) and re-renders the unlock screen in place. The WebView
   is not reloaded, so strings already created in the JS heap are left to
   garbage collection; a reload (F5, context menu) ends the Rust session.
-- `notebook.rs` is the only production module that signs S3 requests or accesses
-  persisted Notebook-compatible objects. It also owns non-secret config and OS
-  keychain integration so secrets do not cross the IPC boundary after setup.
+- `notebook.rs` (with `notebook/` and `secrets.rs`) is the only code that
+  signs S3 requests, accesses Notebook-compatible objects, and reads or writes
+  the config, `secrets.json` and the OS keychain, so secrets do not cross the
+  IPC boundary after setup.
 - Commands available while locked are config, credential, connection, create,
   unlock, lock, activity and flush/status-related calls. All content commands
   fail closed.
 - Rename, move and trash first upload the staged edits of every document they
   move, and refuse ("not uploaded yet") while S3 cannot take them, so no
   outbox entry ever points at a key that is gone.
-- Search ranking is exact-prefix, word-prefix, substring, then recency. Size is
-  UTF-8 byte size.
+- Quick open filters the tree in the page (`TreeModel.search`): names that
+  contain the query without case, in tree order, at most 200 shown.
 - Tauri's typed invoke transport carries image bytes as a `Uint8Array`; Rust
   rejects oversized or invalid payloads before retaining them. This preserves
   the no-filesystem-path trust boundary even though it is not a custom HTTP IPC
@@ -124,33 +105,25 @@ a scalar boundary so the result remains within 255 characters.
 
 The dependencies `aes-gcm-siv` and `pbkdf2` are audited RustCrypto crates and
 avoid hand-written cryptographic primitives. Interoperable browsing necessarily
-uses `ListObjectsV2`. This supersedes the original index-only S3 layout and its
-no-LIST request budget. The newer SMDV envelope remains research code and is not
-written into a Notebook-compatible prefix.
+uses `ListObjectsV2`. This replaces the spec's SMDV envelope and index-only
+layout (with its no-LIST request budget), which were never shipped; their
+research code was removed (see "Cleanup").
 
-Recoverable Trash was first represented under the reserved logical path
-`.secure-vault-trash/<entry UUID>/<original path>`. This is superseded by
-"Trash is Notebook's `_deleted` bin" below; the namespace is now read-only.
+## `freezePrototype` is on
 
-## `freezePrototype` is off
-
-Spec section 11 asks for `app.security.freezePrototype: true`. With it, the
-release build opened to a blank window: Monaco's compiled TypeScript namespaces
-assign `KeyCodeUtils.toString = ...` (and similar) on plain objects at module
-load, which throws once `Object.prototype` is frozen (the JavaScript "override
-mistake"). The same failure can be triggered later by any library code that
-assigns a property named like an `Object.prototype` member, including keys
-derived from document text, so patching the few known sites at build time
-would not be robust.
-
-The option is therefore disabled. What remains in place: `script-src 'self'`
-with no inline scripts or `eval`, `withGlobalTauri: false`, per-command
-capabilities, typed IPC payloads that are never merged into shared objects,
-Markdown preview HTML sanitized in Rust, isolated static-page HTML preview,
-and the navigation guard. The frontend loads through `src/boot.ts`, which shows an explicit
-startup error instead of a blank window if the bundle ever fails to evaluate.
-The end-to-end test catches a re-enabled `freezePrototype`: the release build
-then shows that startup error and four tests fail.
+`app.security.freezePrototype` is `true` (spec section 11): Tauri freezes
+`Object.prototype` in every window's main frame before any other script
+runs. The static-page preview frame is not frozen, and nothing runs in it
+(its sandbox has no `allow-scripts`). The CodeMirror bundle and
+`@tauri-apps/api` run unchanged under it. The Monaco build did not: a library
+assigned `toString` on plain objects at load, which throws once the prototype
+is frozen. The smoke e2e test checks `Object.isFrozen(Object.prototype)` and
+that the startup-failure card from `src/boot.ts` is absent. That card replaces
+a blank window if a future dependency breaks under the freeze. Alongside it:
+`script-src 'self'` with no inline scripts or `eval`, `withGlobalTauri:
+false`, per-command capabilities, typed IPC payloads that are never merged
+into shared objects, Markdown preview HTML sanitized in Rust, the sandboxed
+static-page preview and the navigation guard.
 
 ## Process hygiene
 
@@ -163,12 +136,10 @@ Reporting dumps are outside the app's control and are documented in the README.
 
 ## Preview rendering
 
-- **`preview_render(text)` replaces the spec's `render_preview(doc_id)`.**
-  `doc_update` uploads straight to S3 and Rust keeps no edited buffer, so a
-  render by document ID would show the last saved version and cost an S3 GET
-  plus a decrypt per render. `preview_render` is a pure function of the editor
-  text (16 MiB cap, blocking thread). `render_preview` and its permission were
-  removed, because nothing calls them.
+- **`preview_render(text)` replaces the spec's `render_preview(doc_id)`.** A
+  render by document id would show the last staged or uploaded version, not
+  what is typed. `preview_render` is a pure function of the editor text
+  (16 MiB cap, blocking thread).
 - The frontend calls it 300 ms after the last edit, only while Split or Preview
   is shown and only when the document, its text or its language changed since
   the last render (see "Fewer UI changes"). A sequence number drops responses
@@ -181,14 +152,15 @@ Reporting dumps are outside the app's control and are documented in the README.
 - Markdown documents expose a heading outline parsed in the frontend after the
   same 300 ms edit delay, only while the outline is shown. ATX and Setext
   headings are nested by level, fenced code is ignored, and each branch or the
-  whole tree can be folded. Selecting a heading reveals its source line in
-  Monaco without changing the document.
+  whole tree can be folded. Selecting a heading shows it in the panes shown
+  (see "Markdown navigation").
 - pulldown-cmark with tables, strikethrough, task lists and footnotes; raw HTML
   and HTML blocks are shown as text. ammonia uses the spec allowlist plus
   `span` (blocked-image placeholder). Links keep `href` only for https, http,
-  mailto and `#footnote-N`, and get `rel="noopener noreferrer"`. Relative and
-  `//host` links lose their `href`: v1 has no links between documents, and
-  `//host` would resolve against the app origin. `ol start` is dropped.
+  mailto, `#footnote-N`, `#h-<slug>` and the internal `nb-doc:` / `nb-wiki:`
+  forms (relative links and wikilinks, see "Markdown navigation"), and get
+  `rel="noopener noreferrer"`. `//host` links lose their `href`: they would
+  resolve against the app origin. `ol start` is dropped.
 - **Only inline raster images are shown.** This build stores pasted images
   inline (`image_add` returns a `data:` URI) and has no `secure-img` scheme.
   Images other than `data:image/(png|jpeg|gif|webp);base64,...` become
@@ -246,21 +218,15 @@ Reporting dumps are outside the app's control and are documented in the README.
 
 ## Keychain, config and outbox
 
-- (Before workspaces; now only the migration reads these entries.) The
-  credential JSON is stored as UTF-8 bytes (`set_secret`/`get_secret`) and
-  wiped from memory after use. Windows Credential Manager allows 2560 bytes per
-  item and `set_password` stores UTF-16, which limits a session token to about
-  1158 characters (about 2438 as UTF-8). macOS and Secret Service items were
-  already UTF-8. A Windows item written by an earlier build fails to parse and
-  returns `NO_CREDENTIALS` ("Enter them again"); setup then overwrites it.
 - keyring errors map to `NO_CREDENTIALS`, `KEYCHAIN_TOO_LONG`,
   `KEYCHAIN_UNAVAILABLE` (per-OS message; on Linux it names GNOME Keyring or
-  KWallet) and a catch-all `KEYCHAIN`. If the config says no credentials are
-  stored, Rust returns `NO_CREDENTIALS` without touching the keychain, and
-  credentials are checked before the phrase. On unlock the frontend sends
-  `NO_CREDENTIALS` and `KEYCHAIN_UNAVAILABLE` back to setup with the message
-  and the non-secret fields prefilled; other failures show the backend's safe
-  message or a neutral fallback, never a guessed "wrong phrase".
+  KWallet) and a catch-all `KEYCHAIN`. If `secrets.json` holds no credentials
+  for the workspace (and no earlier build's item awaits migration), Rust
+  returns `NO_CREDENTIALS` without touching the keychain, and credentials are
+  checked before the phrase. On unlock the frontend sends `NO_CREDENTIALS` and
+  `KEYCHAIN_UNAVAILABLE` to the workspace's connect screen with the message;
+  other failures show the backend's safe message or a neutral fallback, never
+  a guessed "wrong phrase".
 - keyring's `crypto-rust` feature encrypts the Secret Service session on the
   D-Bus. The `.deb` and `.rpm` recommend `gnome-keyring`.
 - The outbox lives in `app_local_data_dir/outbox` (`%LOCALAPPDATA%` on
@@ -278,8 +244,9 @@ Reporting dumps are outside the app's control and are documented in the README.
   unlocked phrase (an older copy of an already queued object is dropped, a
   newer one replaces it, as a new save would). Anything else is left
   untouched; Rust logs only the count.
-- Windows credentials still roam with roaming profiles: keyring 3.6.3
-  hard-codes `CRED_PERSIST_ENTERPRISE`. The README says so.
+- Stored credentials roam with Windows roaming profiles: `secrets.json` is in
+  `%APPDATA%`, and keyring 3.6.3 hard-codes `CRED_PERSIST_ENTERPRISE` for the
+  master key. The README says so.
 
 ## Windows build and WebView settings
 
@@ -319,25 +286,19 @@ Reporting dumps are outside the app's control and are documented in the README.
 
 ## Editor line endings and keyboard
 
-- Every Monaco model is set to LF after it is created and after its text is
-  replaced. On Windows Monaco would otherwise default new documents to CRLF and
-  write CRLF to S3. Documents that contain CRLF are normalized when opened and
-  saved as LF on the next edit.
+- The editor keeps LF only: CodeMirror splits lines on LF, CRLF and CR and
+  joins them with LF (no `lineSeparator` is set), also for pasted text, so
+  nothing writes CRLF to S3. Documents that contain CRLF are normalized when
+  opened and saved as LF on the next edit.
 - Backspace and Delete move the selected item to Trash only outside text
   fields, the editor and modals.
 - Modals settle their promise on Escape, the close button and an outside click.
 
-## npm registry and DOMPurify
+## npm registry
 
 - A project `.npmrc` pins `registry=https://registry.npmjs.org/`, and every
   `resolved` URL in `package-lock.json` points there, so installs and CI never
-  depend on a private mirror.
-- `"overrides": { "dompurify": "3.4.16" }` lifts monaco-editor 0.57.0's exact
-  pin past GHSA-p98j-92pf-mc4p, so `npm audit --omit=dev` passes without
-  lowering the audit level. Monaco still ships and uses its own vendored
-  DOMPurify 3.4.15. With hover, suggestions and parameter hints off, it only
-  renders the editor's own constant messages, never document text. Remove the
-  override once Monaco depends on 3.4.16 or later.
+  depend on a private mirror. `package.json` has no `overrides`.
 
 ## Supply-chain policy (`src-tauri/deny.toml`, cargo-deny 0.20.2)
 
@@ -376,10 +337,11 @@ Reporting dumps are outside the app's control and are documented in the README.
 ## CI and release workflows
 
 - **CI** runs on pushes to `main`, pull requests and manual dispatch with a
-  read-only token. The test job runs fmt, clippy `-D warnings` and
-  `cargo test` with `--locked` on Ubuntu 22.04, macOS and Windows. The audit
-  job runs `npm audit --omit=dev`, `cargo audit` and `cargo deny --locked
-  check` (`npm run audit` runs the first two locally).
+  read-only token. The test job runs `npm run build` (type check and bundle),
+  `npm run test:unit`, fmt, clippy `-D warnings` and `cargo test` with
+  `--locked` on Ubuntu 22.04, macOS and Windows. The audit job runs
+  `npm audit --omit=dev`, `cargo audit` and `cargo deny --locked check`
+  (`npm run audit` runs the same three locally).
 - The end-to-end jobs (Linux, Windows) test the **release** binary, built with
   `npm run tauri -- build --no-bundle -- --locked`, so release-only code
   (core-dump hardening, `panic = "abort"`, LTO, strip) runs under test. Linux
@@ -434,8 +396,8 @@ Reporting dumps are outside the app's control and are documented in the README.
   timeout.
 - Checked: the setup heading is actually displayed (WebDriver `isDisplayed`,
   not `innerText`); the page origin is the embedded frontend; `config_get`
-  answers over IPC; the CSP blocks an injected inline script and allows the
-  Monaco worker; no `undefined`/`[object Object]` and no web storage; a link
+  answers over IPC; the CSP blocks an injected inline script, applies the
+  editor's style sheets and starts no worker (`worker-src 'none'`); no `undefined`/`[object Object]` and no web storage; a link
   click shows the confirm dialog with the full URL and does not navigate;
   `window.open` creates no window. The last test bypasses the frontend guard
   (a detached link's `click()`, a `target="_blank"` link and a scripted
@@ -487,7 +449,7 @@ Reporting dumps are outside the app's control and are documented in the README.
   identifier `com.securemd.vault` (config, data and WebView folders, so
   settings carry over), the keychain service names, config and outbox file
   names, the `secure-md-vault::` hash tags that name pending outbox files, the
-  Trash namespace, the Monaco URI schemes, and the pinned WiX `upgradeCode`
+  Trash namespace, and the pinned WiX `upgradeCode`
   (an MSI of the old name is upgraded in place). Notebook's own identifier
   `io.github.dengezar.notebook` is not reused.
 - Linux: `productName` is kebab-cased into the deb and rpm package name, and
@@ -516,9 +478,9 @@ Reporting dumps are outside the app's control and are documented in the README.
 
 ## Trash is Notebook's `_deleted` bin (owner decision, 2026-10-01)
 
-Supersedes the spec's Trash design (`.origin` tandem files) and this app's
-earlier `.secure-vault-trash/<UUID>/<original path>` layout. Items deleted in
-Notebook never showed up, because Notebook keeps its own bin.
+Replaces the spec's Trash design (`.origin` tandem files) and this app's
+earlier `.secure-vault-trash` layout, so an item deleted in either app shows
+in both.
 
 - Layout, from Notebook's `src/app/deleted_items.rs`: the item moves to
   `_deleted/items/<id>/item/<name>`; its original parent is recorded as the
@@ -577,9 +539,7 @@ Notebook never showed up, because Notebook keeps its own bin.
   while such a close is pending (5 s fallback; see "Save model"). On macOS
   the default menu's Quit (which terminates without a close event) is
   replaced by an item that closes the window. The webview no longer has the
-  window close, minimize and toggle-maximize permissions, and the unused
-  `listenToVaultEvents` is gone. Rust emits one event, `auto-lock` (the only
-  use of `core:event:allow-listen`).
+  window close, minimize and toggle-maximize permissions.
 - **Lock, a workspace switch and moving the open workspace clear the page**
   (see Product behavior). Rust checks idleness every 10 s
   (`check_idle_session`; `activity_ping` records activity): it emits
@@ -595,7 +555,7 @@ Notebook never showed up, because Notebook keeps its own bin.
 - Access key IDs must be printable ASCII and are checked before anything is
   stored; the masked ID is cut by characters. A pasted zero-width space
   crashed `credentials_set` before.
-- A saved bucket without stored credentials opens setup with the
+- A workspace without stored credentials opens its connect screen with the
   "No S3 credentials" message instead of asking for the phrase first.
 
 ## Save model: local outbox first, S3 rarely (2026-10-02)
@@ -613,9 +573,11 @@ window at 40 s, before the outbox was written: the edit was lost.
   the base version's ETag and sends nothing when nothing is staged.
   `doc_open` returns a staged edit (`dirty: true`) without a request.
 - **When.** The frontend (`src/documents.ts`) stages 1 s after typing pauses
-  and commits on Cmd/Ctrl+S, document switch (in the background, after the
-  next document is shown), window blur or hidden, close, lock, 30 s idle and
-  120 s of continuous editing. Cmd/Ctrl+S on a document without unsynced
+  (5 s for a text over 2 Mi characters, 2026-10-05; at the latest 10 s after
+  the first unstaged edit) and commits on
+  Cmd/Ctrl+S, document switch (in the background, after the next document
+  is shown), window blur or hidden, close, lock, 30 s idle and 120 s of
+  continuous editing. Cmd/Ctrl+S on a document without unsynced
   edits sends nothing. One timer serves all of it; a keystroke never creates
   or clears a timer.
 - **Journal state** (Rust, per S3 key, cleared on lock): the staged
@@ -647,8 +609,8 @@ window at 40 s, before the outbox was written: the edit was lost.
   commit a clean document, the close-during-hang replay, the re-base rule,
   conflicts and offline retries.
 - Other devices see edits 30–120 s later than before; Cmd/Ctrl+S syncs at
-  once. `doc_update` is gone; there is no combined stage-and-upload call, so
-  an upload hanging on S3 can never hold up the next outbox write.
+  once. There is no combined stage-and-upload call, so an upload hanging on
+  S3 can never hold up the next outbox write.
 
 ## Fewer UI changes (2026-10-02)
 
@@ -687,18 +649,17 @@ a 5,000-line Markdown document, 36 typed keys per run):
   pause → 2. After a document switch the first render waits for the editor's
   paint (rAF, then a task): the switch to the big document's long task went
   103 → 85 ms.
-- **Large documents.** Over 512 KB of text the preview pauses: "Preview paused
-  for large documents." with a **Render** button that renders the current
-  text once; typing never re-renders it, and Edit mode does not keep its
-  hidden copy. The 16 MiB hard cap stays. With the HTML preview the note sits
-  above the page frame.
+- **Large documents.** Over 512 KB of text, Split pauses its preview:
+  "Preview paused for large documents." with a **Render** button that renders
+  the current text once; typing never re-renders it (the note comes back
+  above the last render), and Edit mode does not keep its hidden copy. The
+  note goes as soon as the text is rendered (it used to stay above a rendered
+  HTML page). Preview, focus mode and document windows are for reading:
+  there a large document renders by itself once per open or text change
+  (2026-10-05). The 16 MiB hard cap stays.
 - **Mode and outline toggles** send no IPC: 376 KB `preview_render` → 0 and
   6,998–7,004 preview nodes → 0 for Edit, Split, Preview and outline open or
-  close. Building the outline itself takes 4–8 ms for 501 headings. The long
-  tasks that remain on these toggles (about 100 ms for Split and outline
-  open, about 320 ms for Preview) are Monaco re-wrapping the 5,000 lines at
-  the new width: 0 in Preview mode, where only the preview pane reflows. That
-  is plan item C7 (simple wrapping above 32 KB, no layout at width 0).
+  close. Building the outline itself takes 4–8 ms for 501 headings.
 - **Not done: `content-visibility: auto` on preview blocks.** Measured: no
   layout gain on outline toggles (16 vs 18 ms over 6 toggles), and each list
   grew by about 2 px, because the containment it implies stops the first and
@@ -739,7 +700,6 @@ design (§4 key hierarchy, §14 idle lock).
   and `vault_create` (and their permissions) were removed once the frontend
   no longer called them: `workspace_save` and `vault_unlock` cover them, and
   nothing that edits a workspace can wipe its credentials.
-  (`connection_test` predates workspaces and is left as it was.)
 - **Sessions.** A session belongs to the active workspace and carries the
   location it was unlocked with; S3 commands use that, not the config. Editing
   the active workspace's bucket, region, prefix or endpoint ends the session
@@ -917,7 +877,7 @@ Code's soft-wrap shortcut, no brand block, and one clean row of buttons.
   it; Cmd/Ctrl+Z stays Undo), or **Wrap** in the status bar
   (`aria-pressed`, struck through when off). One setting for every document
   until the app quits, on by default. The key is caught on `window` in the
-  capture phase, ahead of Monaco, so the editor never types "Ω"; text fields
+  capture phase, ahead of the editor, so it never types "Ω"; text fields
   and dialogs keep it (real AppKit events: "Ω" typed in Quick open and in the
   New file dialog, wrap unchanged; toggled from the editor and a sidebar row).
   `event.code` was rejected: it is the physical US position, so on QWERTZ
@@ -925,27 +885,10 @@ Code's soft-wrap shortcut, no brand block, and one clean row of buttons.
   With `keyCode`, German AppKit events in WKWebView: the key printed Z
   (code `KeyY`, keyCode 90) toggles without typing, the key printed Y types
   "¥", and US Option+Z still toggles.
-  Documents of 2 MB and more now follow the setting too, always with the
-  "simple" strategy; advanced wrapping, which froze the app for 20 s on a
-  12 MB page, is never used for them. A document that crosses 2 MB while open
-  switches strategy at its next open, as before. They wrap at a fixed column
-  (`wordWrapColumn`), not `bounded`: bounded wrapping depends on the viewport,
-  so every layout change re-wrapped all 12 MB, twice for a pane resize
-  (Monaco, then the readable-width column) and at column 1 in Preview mode,
-  where the hidden editor lays out 5 px wide (230 to 261 ms in WKWebView for
-  Edit→Preview, the outline toggle and a narrower pane). Now a hidden editor
-  keeps its layout, and for a large document the column follows the pane
-  once, 250 ms after the width last changed (about 100 ms of work); until
-  then the text may run past the right edge. Measured on 12 MB documents
-  (116,118 lines, and one 12 MB line), longest main-thread task: toggle 65 to
-  104 ms in Chromium and 81 to 129 ms in WKWebView; open with wrap on 70 to
-  173 ms (Chromium) and 136 to 164 ms (WKWebView, import included);
-  Edit↔Split↔Preview, the outline toggle and pane width changes 0 to 107 ms
-  in both (WKWebView at 820×560 and 1180×760, Chromium at 1280×800).
+  How lines wrap: see "Editor: CodeMirror 6 instead of Monaco".
 - **Outline drawer over the editor.** Below 850 px the outline is a drawer
-  (z-index 10) over the editor, and Monaco's horizontal scrollbar (z-index 11,
-  shown with wrap off) was drawn over it and took its clicks. `.editor-host`
-  is now `isolation: isolate`, so Monaco's z-indexes stay inside the editor.
+  (z-index 10) over the editor. `.editor-host` is `isolation: isolate`, so
+  the editor's own z-indexes stay inside it and never cover the drawer.
 - **e2e.** The HTML preview test paints its frame the way `swapPage()` and
   the scrollbar style do (frame keeps `<html>`, `<head>`, `<body>`; style
   first in `<head>`) and asserts the scrollbar takes room (WebKitGTK: pass).
@@ -974,13 +917,15 @@ Code's soft-wrap shortcut, no brand block, and one clean row of buttons.
   windows are compared with innerWidth, not matchMedia: WebKit answered a
   resize event with the previous size's `matches`.
 - **No browser storage, one IPC per change.** `layout_set({ sidebar_width,
-  outline_width, split_ratio })` (validated, written durably with the other
-  preferences, no S3 request, permission `allow-layout-set`) is called once
-  when a drag ends, on a double-click, or 500 ms after the last resize key
-  (and before the window closes); never per pointer move. `config.json` gets
+  outline_width, split_ratio, preview_zoom })` (validated, written durably
+  with the other preferences, no S3 request, permission `allow-layout-set`)
+  is called once when a drag ends, on a double-click, or 500 ms after the
+  last resize key (and before the window closes); never per pointer move.
+  Every value is optional and the ones not given stay, so the zoom (sent
+  alone) never resets sizes another window changed. `config.json` gets
   `"layout"`; `config_get` returns it, a config without it gets the defaults
-  (280, 240, 0.5) and a bad value is repaired to its default without making
-  the file unreadable. Browser mode keeps the sizes in memory.
+  (280, 240, 0.5, 100) and a bad value is repaired to its default without
+  making the file unreadable. Browser mode keeps the sizes in memory.
 - **Stacked Split.** Below 851 px Split stacks the editor above the preview
   (unchanged), so the split handle is hidden there; a vertical one would have
   two panes of about 240 px in 560 px of height to share. The outline is a
@@ -1002,24 +947,15 @@ Code's soft-wrap shortcut, no brand block, and one clean row of buttons.
   iframe never takes the pointer and the cursor stays `col-resize`; showing
   it restyles one element (a class on `:root` restyled everything).
 - **Narrow margins off `:root`.** The narrow-window `--file-margins` is now
-  set on `.editor-host` and `.preview` (monaco.ts reads it from the editor's
-  element). Set on `:root`, crossing 850 px restyled every element: 430 ms
+  set on `.editor-host` and `.preview` (the editor's margins use it there). Set on `:root`, crossing 850 px restyled every element: 430 ms
   in WebKit with that outline open; before this change the crossing was
   cheap only because the sidebar width changed at the same time (proof: the
   old code with a constant sidebar took 450 ms; adding a 1 px sidebar change
   made it 74 ms).
-- **Measured** (12 MB Markdown, 116,000 lines, wrap on, Split, outline with
-  2,903 headings; WKWebView harness with real AppKit mouse events, 120 Hz
-  drags over 3 s per handle): 51 to 60 fps while dragging; longest main-thread
-  task 99 to 144 ms, which is the large-document re-wrap when the pointer
-  rests at a limit for over 250 ms (editor at its 240 px minimum: 144 ms);
-  after the drag 101 to 121 ms (the one re-wrap). At 820×560: 59 to 60 fps,
-  longest 104 ms. Window resizes 1280↔1000↔820: longest 111 to 126 ms.
-  Chromium (browser mode, synthetic pointer events, a hidden pane drawing
-  about once a second): no task over 62 ms.
-  Real AppKit drags of the split edge across the HTML page's iframe follow
-  the pointer (ratio 0.5 to 0.68 mid-drag); a drag released outside the
-  window ends normally.
+- **Measured** (12 MB Markdown, Split, outline with 2,903 headings; WKWebView
+  harness with real AppKit drags): 51 to 60 fps while dragging, 59 to 60 fps
+  at 820×560. Drags of the split edge across the HTML page's iframe follow
+  the pointer, and a drag released outside the window ends normally.
 - **Review fixes.**
   - *No sidebar jump at 850 px.* The content's least width no longer depends
     on the breakpoint: it is what Split and the outline need side by side
@@ -1034,30 +970,815 @@ Code's soft-wrap shortcut, no brand block, and one clean row of buttons.
   - *Tab order follows the screen.* The outline handle now follows the
     outline and the split handle follows the editor in the DOM (both are
     absolutely positioned, so the grid is unchanged). Placed after the
-    preview, forward Tab never reached them: Monaco keeps Tab for indenting.
+    preview, forward Tab never reached them: the editor keeps Tab for
+    indenting.
   - *Hit areas off the scrollbars.* Each 8 px target starts on its divider
-    and reaches into the pane to its right (Monaco's left gutter, the
-    preview's margin); centred, it took 3 to 4 px of the file tree's, the
-    outline's and Monaco's scrollbars. The accent line stays on the divider.
-  - *Every document wraps at a fixed column.* Below 2 MB the editor wrapped
-    `bounded` with the advanced (DOM-measuring) strategy, so each frame of a
-    drag re-wrapped the whole document whenever the editor was narrower than
-    the readable width, which is always the case in Split. WKWebView, real
-    drags in Split, longest tasks before: 1.9 MB 1 to 2 fps with 2.3 to 6.2 s
-    freezes; 0.5 MB 3 to 6 fps, 1.07 and 1.41 s; 50 KB 19 fps. Now soft wrap
-    uses `wordWrapColumn` for every document (fitReadableWidth keeps the
-    column inside the pane, so `bounded` added nothing but the re-wraps);
-    from 16 KB the column follows once, 250 ms after the width settles (as
-    2 MB documents already did); from 64 KB the wrapping counts characters
-    (`simple`), so the right edge of Markdown's proportional text is a little
-    more ragged. With wrap on, `scrollBeyondLastColumn` is 0: Monaco's 4
-    columns gave a line that fills the column a horizontal scrollbar once the
-    margin is narrower than about 34 px. 64 KB rather than 128 KB: one
-    advanced re-wrap of 123 KB took 131 to 173 ms, too close to 200 ms.
-  - *Measured after the fixes* (same harness, Split, 3 handles, 400 ms rest
-    at the far end): 15 KB, 73 KB, 0.2, 0.5 and 1.9 MB at 59 to 60 fps with no task
-    over 50 ms during or after a drag (0.5 and 1.9 MB also with the outline,
-    and window resizes 1280↔1000↔820 with no task over 50 ms); 50 to 63 KB
-    (advanced, deferred) one re-wrap of 60 to 87 ms; 12 MB unchanged: 51 to
-    59 fps, longest 104 to 138 ms during, 106 to 122 ms after, resizes 117
-    to 124 ms.
+    and reaches into the pane to its right (the editor's or the preview's
+    margin); centred, it took 3 to 4 px of the file tree's, the outline's and
+    the editor's scrollbars. The accent line stays on the divider.
+
+## Delete permanently on AWS, folder import (2026-10-05)
+
+- *Delete permanently failed on AWS with "S3 denied access".* Purge used one
+  presigned DeleteObjects (rusty-s3 0.10.2): `POST /?delete=1`, only `host`
+  signed, Content-MD5 sent unsigned. MinIO accepts that; AWS answered 403
+  while CopyObject and single DeleteObject (Move to Trash) passed. The
+  signature itself is right: AWS's own signer (aws-sigv4 1.4.2) computes the
+  same one for that input. What differs from the AWS SDKs is the request:
+  they send `?delete` with no value (the only form AWS documents) and sign
+  Content-MD5 with the other headers present. Without an AWS account at hand
+  the exact rule AWS applied is unconfirmed, so two changes:
+  - The request is now what the SDKs send: `?delete`, Content-MD5 and
+    Content-Type signed (`delete_objects_url`, signed with rusty-s3's public
+    `signing::sign`; jiff, already in the graph, gives it the time). A unit
+    test pins the signature aws-sigv4 computes for it; MinIO accepts it and
+    answers SignatureDoesNotMatch when the signed MD5 is changed.
+  - A refused batch (400, 401, 403, 405, 411, 501, a 200 carrying an
+    `<Error>` or no `<DeleteResult>`) or per-key errors other than NoSuchKey
+    fall back to unconditional DeleteObject requests for exactly those keys,
+    8 at a time; once S3 refuses these credentials (AccessDenied, signature,
+    clock), the requests not yet sent are skipped. Unless the code is
+    transient (InternalError, SlowDown…), the S3Remote remembers for the
+    session and later purges go straight to single deletes; a new unlock
+    tries the batch again. Errors every request would get (unknown key,
+    clock skew, expired token, missing bucket) are reported, not retried.
+    Empty Trash and Restore's clean-up of the bin container use the same
+    path. Budgets (fake S3): batch accepted 1 request; refused 1 + N; later
+    in the session N.
+  - Single deletes run in two waves: an entry's markers (`item/.notebook_dir`,
+    `parent/**`) first, its item (`item/<name>…`) only once they are gone.
+    Notebook lists an entry only while its item exists, so after a failure
+    the entry stays in Trash and a retry removes what is left; deleting the
+    item first could leave markers no entry lists and no purge reaches.
+    After a failed purge the frontend takes the session's tree again and
+    redraws the Trash dialog from it. (Not covered: a batch accepted except
+    for an entry's markers, whose single retries fail too; Empty Trash does
+    not sweep such leftover containers, to delete only listed entries.)
+- *S3 error codes.* Replies are mapped by S3's `<Code>` (letters and digits
+  only) before the status: SignatureDoesNotMatch, RequestTimeTooSkewed,
+  InvalidAccessKeyId, expired tokens, NoSuchBucket and invalid-request codes
+  get their own message. S3's message text never reaches the UI, and the one
+  log line (batch delete disabled) holds only the status and code. 501 is no
+  longer retried.
+- *Folder import.* Dropping a folder said "unsupported file type": the drop
+  handler read `dataTransfer.files`, where a folder is a 0-byte File. The
+  handler now takes `webkitGetAsEntry()` for each item during the event and
+  walks folders with `readEntries` until it returns an empty batch
+  (`src/folder-import.ts`, pure and unit-tested). Hidden entries are counted
+  and never entered; reserved or invalid names are refused (a folder with
+  its contents); names are made unique without case below the drop target,
+  as the backend does, so a dropped `Notes` next to `notes` becomes
+  `Notes 2` rather than merging. Folders are created level by level with
+  `folder_create`, then documents with `doc_create` into the returned ids, 8
+  at a time: one PUT per folder and file, deltas applied without listing,
+  the tree drawn at most twice a second. Limits: 5,000 files, 2,000 folders,
+  20,000 entries walked; over a limit nothing is created. Browser mode, a
+  synthetic drop of 5 folders and 302 files: no long task (over 50 ms).
+  A lock or switch ends the import: the check runs again after each file is
+  read, right before its request (ids are paths, so a late request would
+  land in the other workspace), late deltas are dropped, and the dialog then
+  gives counts only, never names. Names with control or text-direction
+  characters are refused (the backend refuses control characters for every
+  new name), names like ` .git` count as hidden, the summary shows such
+  characters as U+FFFD, and a folder that cannot be read is reported and not
+  created.
+
+## Trash count, focus mode, reading and writing (2026-10-05)
+
+- *The Trash count did not follow Move to Trash and Restore.* Rust's deltas
+  were right (a unit test pins that Restore, Delete permanently and Empty
+  Trash remove the entry's node and Move to Trash adds one). The frontend
+  applied those deltas without drawing, so that the caller draws once after
+  following the change, but two paths then only moved the selection (two
+  rows): Move to Trash of the open document opens the first document, and
+  Restore of a document opens it. The count, and in the first case the
+  trashed row, stayed until the next full draw. The tree model now counts
+  its changes and the sidebar marks what it drew (`needsDraw`,
+  `markDrawn`); moving the selection draws everything when the model
+  changed, and a delta applied without drawing is drawn on the next frame
+  if nothing drew it (an import keeps its own timer). `tree-model.ts` no
+  longer imports `ipc.ts` at runtime (`kindName` moved there and is
+  re-exported), so `tests/unit/tree-model.test.mjs` runs it; it failed
+  before the change. Browser mode now keeps Trash like the app (entries,
+  Restore, Delete permanently, Empty Trash) instead of dropping trashed
+  items, so the count can be checked there.
+- *Focus mode (F9).* One class on `.shell` hides the sidebar, header,
+  status bar, outline and resize handles; the panes keep their DOM, nothing
+  reloads, and the editor and preview stay centred at the readable width.
+  It opens in Preview (every document has one: Markdown blocks, the HTML
+  page, plain text as is; the task's "plain text stays in writing" assumed
+  plain text had no preview, which it has here). The OS window title is the
+  file name, through `getCurrentWindow().setTitle` (capability
+  `core:window:allow-set-title`, nothing else added), and "Notebook" again
+  on leaving, lock, auto-lock and workspace switch, so no name stays in the
+  Window menu once locked. Leaving gives back the view mode from before;
+  only someone who entered from Preview and leaves writing gets the last
+  writing mode. Esc leaves too, unless a dialog, a menu or a text field
+  (the editor included) has it. F2 and Delete, which act on the hidden
+  sidebar's selection, do nothing; Quick open, New file, New folder and a
+  file drop leave focus mode first, as their UI is in the sidebar. No new
+  navigation.
+- *An open outline stays laid out in focus mode.* Shown again from
+  `display: none`, the 54,011 headings of a 12 MB test document took one
+  842 ms task when focus mode ended. The panel now keeps its width out of
+  the grid with `visibility` and `content-visibility: hidden`, and the
+  resizers do not refit in focus mode. Browser mode (Chrome), that 12 MB
+  document: entering, leaving and both toggles, 9 transitions with the
+  outline closed and 6 with it open: no task over 50 ms; each key handler
+  0 to 4 ms.
+  WebKit was not measured.
+- *HTML pages in focus mode* (since 2026-10-05 also in Split and Preview,
+  see "Preview banners and zoom"). The page's frame runs no script, so after a
+  click in it the page keeps every key, and focus mode has nothing else to
+  click. While a page is shown, a 250 ms poll gives the keys back
+  to the preview once no text is selected in the page (Copy still works
+  while it is) and the mouse button is up (the frame is not `:active`;
+  without that, a press held before the drag lost the keys mid-selection
+  and Cmd+C then copied nothing), and arrow, page, space, Home and End
+  keys on the preview scroll the page's frame. A poll, because a click
+  that activates the window right in the page sends the parent no event.
+- *Reading and writing (Cmd+Shift+V, Ctrl+Shift+V off macOS).* Replaces the
+  Edit, Split, Preview cycle on the same keys: Edit or Split goes to
+  Preview, Preview back to the last writing mode; in focus mode Preview and
+  the editor alone. Caught in the capture phase ahead of the editor (no paste
+  and match style in it); Quick open and dialogs keep the keys.
+  `keyCode` 86 like Alt+Z, so it is the key printed V on any layout. The
+  rules are pure (`src/view-mode.ts`, unit-tested).
+- *Not checked in the app:* the title IPC call and the permission at
+  runtime, F9 and Cmd+Shift+V in WKWebView (browser mode, Chrome only).
+  Cmd+Shift+N is New folder, so it is not free for another command.
+
+## Document windows, one writer per document (2026-10-05)
+
+- *Open in new window* (header button, a document's sidebar menu,
+  Cmd/Ctrl+Shift+O, since Cmd+Shift+N is New folder): Rust's
+  `open_document_window` builds a `doc-<uuid>` window from a copy of the
+  main window's `tauri.conf.json` entry (same webview settings), 860 x 900
+  fitted to the screen, minimum 480 x 360, cascading from the main window,
+  titled with the file name. `window.rs` builds every window through one
+  function, so each gets the navigation guard, `on_new_window` Deny and the
+  close guard (now per window label; the main window's fallback is 10 s, as
+  it first closes its document windows). Only a reload of the main window
+  ends the session.
+- *The URL is not trusted.* The page gets `index.html?window=document&id=…`
+  (form-encoded) only to know it is a document window; `document_window_info`
+  answers by the window's label which document it holds, and that is what
+  it shows and writes (after a rename the URL's id is stale anyway).
+- *Least privilege.* Document windows have their own capability
+  (`capabilities/document-window.json`, windows `doc-*`): their document
+  (open, stage, commit), preview, links, images, the close guard, activity,
+  `core:event:allow-listen` and `document_window_close` for the Close
+  button of a window with nothing to show (it closes only itself; see the
+  review fixes below). No tree, Trash, workspace, lock
+  or settings commands, and `config_get` is not needed (the theme and accent
+  come with `document_window_info`). The main capability gains only
+  `open_document_window` and `document_windows_close`.
+- *One writer per document* (`notebook/doc_windows.rs`): the main window
+  writes every document no document window holds; a document window holds
+  one document of the session it was opened in. `doc_stage` and
+  `doc_commit` refuse any other window (`NOT_WRITER`); `doc_open` answers
+  the main window `read_only` for a held document and refuses a document
+  window anything but its own. Before the hand-over the main window writes
+  its pending edit to the outbox (the editor is read-only meanwhile) and
+  then drops that document from its save model (`DocumentSession.handOff`),
+  so it never retries or uploads it; the new window opens the staged text
+  and uploads it. A read-only open never marks a document dirty.
+- *Holds are session-scoped.* A hold records the session id; one of an
+  ended session counts for nothing, so a leftover window can never write
+  into a later session, even with the same paths (ids are path-derived).
+  Lock, workspace switch, phrase change and quit first close every
+  document window as its close button does (`document_windows_close`: it
+  saves, then closes); one that cannot even write the outbox keeps the
+  workspace open. As a backstop, `vault_lock`, `vault_unlock`,
+  `workspace_*`, `passphrase_change`, a main-window reload and the forced
+  idle lock destroy any window without a current hold.
+- *Writer changes.* A document window's commit emits `document-committed`
+  to the main window (the only other window showing it; with any conflict
+  copy's tree delta), which re-reads the document from Rust's outbox or
+  cache (no S3 request); its close emits `document-window-closed`, and the
+  main window makes the document writable again. Opening the same document
+  again focuses its window. Typing in a document window keeps the workspace
+  open: `activity_ping` from it tells the main window, which runs the idle
+  lock.
+- *Rename, move, Trash.* Before any of them Rust asks the windows holding
+  the item to write their pending edit to the outbox
+  (`window.__notebookFlush`, answered by `document_window_flushed`, at most
+  2 s); the change then uploads it as for the main window. Afterwards a
+  hold follows its document to the new id (the window is retitled and
+  told, `document-window-moved`); a document that left the tree (Trash)
+  closes its window and the main window says so. A conflict copy made by a
+  document window moves the hold to the copy, as the main window keeps
+  editing a copy it made.
+- *Document windows are focus mode for good.* F9 and Esc do nothing (no
+  chrome to restore); Cmd/Ctrl+Shift+V toggles Preview and the editor,
+  Cmd/Ctrl+S uploads, every other shortcut is off. A theme change in the
+  main window reaches a document window when it next opens.
+- *Checks.* Rust unit tests for the rules (hand-over, refusal of
+  non-writers, read-only reads, release on close, session end and a new
+  session, rename and Trash, conflict copy) and for the window URL; unit
+  tests for the URL parsing, the new key and the hand-over in the save
+  model. Browser mode: the document-window boot path (sample documents),
+  and the IPC paths with a temporary stand-in page. Not run in the Tauri
+  app (rules forbid the real profile): window creation, placement, focus,
+  close guard and the capability at runtime.
+
+## Review fixes: document windows, reading position (2026-10-05)
+
+- *A read-only open moved the writer's base.* `doc_open` from the main
+  window for a document another window writes set the journal base (the
+  If-Match of the writer's next upload) to the version it read. After a
+  Refresh had seen another device's change, the writer's next save then
+  overwrote that change and said "Saved". Only the writer moves the base
+  now; a reader's download still fills the cache. `s3_budget.rs` pins both
+  sides (it failed before: the upload saved instead of making a conflict
+  copy).
+- *Edits typed in a document window during a rename, move or Trash.* The
+  window wrote its pending edit when asked, but could stage again while S3
+  copied the objects; `finish_moves` then dropped that edit with the old
+  key (an orphaned outbox entry, a "Saved" that was not). Now the holders
+  are frozen from just before `commit_subtree` until the change ends
+  (`freeze_holds_within`, released however it ends): their `doc_stage` and
+  `doc_commit` answer `BUSY`, checked again under the journal lock so an
+  edit is either uploaded before the move or refused. The window itself is
+  read-only from the flush request until `document-window-resume` (Rust
+  emits it after the change, done or failed; 2 minutes at most), Cmd+S
+  waits, and an edit refused meanwhile is written and uploaded under the
+  document's new id. Tests: rename and Trash with a slow fake S3 (both
+  failed before), and the freeze rules.
+- *Open in new window* writes every pending edit first, also a failed
+  outbox write of a document no longer open, which the hand-over would
+  otherwise forget.
+- *Events reach only their window.* The global `listen` receives every
+  `emit_to` meant for any window (its target is Any), so each window now
+  listens on itself (`getCurrentWebviewWindow().listen`); no permission
+  change.
+- *A document window closes only itself.* `core:window:allow-close` let it
+  close any window by label, the main window included; the Close window
+  button calls `document_window_close` (document windows only, through the
+  close guard) instead.
+- *No file name stays in the title.* Rust resets the main window's title
+  on a reload of its page and on a forced idle lock; the page resets it
+  otherwise, but a reloaded or hung page cannot.
+- *Reading position.* Cmd+Shift+V, F9 and the Edit / Split / Preview
+  buttons keep the place. A pane that stays shown keeps its own place
+  (the preview by its top block, since WebKit has no scroll anchoring and
+  the column widens with F9); a pane shown now opens where the other one
+  was. Between editor lines and preview pixels, the headings present in
+  both are fixed points, linear in between (`view-mode.ts`, two layout
+  reads per mapping, unit-tested); HTML pages, plain text, large documents
+  and a preview whose headings differ map proportionally, and a preview
+  with nothing to scroll ("Preview paused") leaves the editor's place
+  alone. The editor keeps its top line when its width changes (F9, mode
+  switches).
+- *Focus.* Leaving focus mode focuses the pane shown (it was the page
+  body, where Backspace asked to trash the open document); a document
+  window starts with the preview focused, so the keys scroll it at once.
+- *Header and menu.* "Open in new window" is disabled without an open
+  document. "Editing in another window" shrinks to its icon when the header
+  is under 720 px (a container query; WebKit before Safari 16, on macOS 11,
+  ignores it and keeps the full chip), so the file name keeps the room; its
+  tooltip and label still say it. The sidebar menu shows ⌘⇧O / Ctrl+Shift+O
+  at the item's end instead of an icon (the labels line up), and the Edit,
+  Split and Preview tooltips name Cmd+Shift+V and F9.
+- *E2E* (`tests/e2e/smoke.test.mjs`): a fresh profile is locked and the
+  Linux run has neither a Secret Service keyring nor an S3 endpoint to
+  unlock one, so no document window can open there; the new check pins that `open_document_window` answers
+  `LOCKED` without a window, that page script cannot build a window
+  (`plugin:webview|create_webview_window`, `plugin:window|create`), and
+  that the document-window commands are refused to the main window.
+- *Measured* (browser mode, Chrome, in a hidden pane where frames do not
+  run): a 12.9 MB document with the outline closed, F9 and Cmd+Shift+V
+  handlers 2 to 12 ms, no long task, and the editor's place kept; with its
+  54,000-heading outline open, 54 to 130 ms per transition. Timed inside
+  the handler, the reading position costs 0 to 1 ms and the rest is the
+  page relayout (a bare class toggle plus layout: 52 to 69 ms), which now
+  runs in the key handler instead of the next frame. The earlier "0 to 4
+  ms" figure never included that relayout (no frame ran). One run showed
+  340 and 590 ms for the first two toggles after building the 13 MB text;
+  it did not recur. WebKit was not measured.
+
+## Markdown navigation: heading ids, vault links, outline (2026-10-05)
+
+Report: "Markdown navigation is not working." Three parts.
+
+- *Heading ids.* preview.rs gives every heading `id="h-<slug>"`: the
+  github-slugger rule (NFC, the whole text lowercased so a final `Σ` is `ς`,
+  letters/numbers/marks, `-` and `_` kept, each whitespace a `-`, the rest dropped; cut at 200 chars;
+  repeats `-1`, `-2`, …), from the heading's text and code (not image alt
+  text or footnote marks). The fixed prefix means no document can produce an
+  id of an app element or a global (`__proto__` is `h-__proto__`); document
+  ids still never pass (raw HTML is text, heading attributes stay off, and
+  the sanitizer admits an `id` only on h1–h6 as `h-` plus slug characters,
+  or on footnote sections). `#Heading` links are rewritten to `#h-<slug>`,
+  percent-encoded ASCII, and the sanitizer accepts only that exact form;
+  `#footnote-N` stays. src/vault-links.ts `slugify` is the same function
+  (tests on both sides use the same cases), so the frontend also accepts a
+  fragment written as heading text.
+- *Vault links.* Relative links and wikilinks (pulldown-cmark's
+  `ENABLE_WIKILINKS`) become `nb-doc:<path>#<id>` / `nb-wiki:<target>#<id>`:
+  a reserved scheme, not a data attribute, so they stay focusable links with
+  Enter, middle click and the context-menu guard of every other link. Only
+  the rewriter writes them (a document's own `nb-doc:` or `nb-wiki:` link
+  loses its href), the target is percent-encoded with letters, digits,
+  `-._~/` left, control characters and over-long targets are refused, and
+  `is_internal_href` accepts only that canonical form. They carry a path
+  and a heading, nothing else: navigation.ts hands them to main.ts only from
+  inside `.preview`, main.ts resolves them against the tree (relative to the
+  linking document's folder; names compare as NFC, lowercased per code
+  point, then NFC again: `nameKey`), and opens a document,
+  selects a folder, or shows "Link not found" / "Link is ambiguous". The
+  WebView never loads them; the navigation guard and the CSP are unchanged.
+  Wikilinks: exact name first, else name without extension with Markdown
+  first; several are narrowed by the folders written in the link, then the
+  one nearest the linking document wins (folder steps); a tie is ambiguous,
+  not a guess. `..` above the root is missing, not clamped.
+- *Document windows* hold no tree. `document_window_info` now also returns
+  the document's vault path (asked again at each link, so renames and moves
+  count): the window resolves a link against its own path only, scrolls
+  itself for its own document, and otherwise calls `document_link_open`
+  (document windows only, `allow-document-link-open`). Rust re-checks the
+  href, takes the starting folder from the window's hold (never from the
+  page), emits `document-link` to the main window and focuses it; the main
+  window resolves and validates against its tree like its own links.
+  Browser mode uses a BroadcastChannel instead.
+- *Outline.* Selecting a heading no longer switches Preview to Split: Edit
+  goes to the line, Preview scrolls the preview, Split does both; in Preview
+  the focus stays in the outline. Outline items map to preview headings by
+  index among the top-level headings when the counts match (outline.ts and
+  the renderer both skip fenced code), else by the generated id of the text,
+  else by the existing line mapping. Focus mode and document windows hide
+  the outline by design; their heading links work. If the top-level counts
+  differ, all headings outside block quotes are tried by index before the id
+  (the outline counts a heading in a list item, never one in a quote). For
+  the ids, outline.ts labels keep code spans, escaped characters and `_`
+  inside words (CommonMark: no emphasis there), so `## parse_config` maps to
+  `h-parse_config` as in preview.rs; both test suites check the same
+  headings. Edit mode has only these labels to find a link's heading line.
+- *Scrolling.* Only the preview pane scrolls (`scrollPaneTo`, 16 px of room),
+  never its ancestors (`scrollIntoView` could move the shell). Every jump
+  is instant: in-page link clicks no longer scroll smoothly (2026-10-05,
+  "Footprint and hot paths"). As a native fragment
+  link would, the target heading then takes the focus (tabindex -1 until it
+  loses it, no ring, no scroll), so the next Tab goes on from there; only
+  when the focus was in the preview or nowhere, never from the editor or
+  the outline. `message()` focuses its OK button like `confirm()`, so
+  "Link not found" closes with Enter or Escape.
+- *Browser mode*'s stand-in renderer writes the same ids and hrefs
+  (`previewHref`, `wikiHref`), and the sample documents link to each other,
+  so all of this can be tried without the app.
+
+## Preview banners and zoom (2026-10-05)
+
+- **Banners.** "Scripts off (N)" moved from the HTML preview pane to the
+  status bar (normal mode only); "Preview paused" is a Split-only state that
+  goes once the text is rendered; Preview, focus mode and document windows
+  render large documents by themselves (see "Large documents" above).
+- **Zoom (content zoom, owner feedback 2026-10-05: "zoom applies only in
+  focus mode", "the size label is disturbing").** Cmd/Ctrl+= (or +),
+  Cmd/Ctrl+- and Cmd/Ctrl+0 zoom what is shown: ONE level scales the editor
+  text and the preview (HTML page, Markdown and plain text) together, in
+  steps of 50, 67, 80, 90, 100, 110, 125, 150, 175 and 200%
+  (`src/preview-zoom.ts`, pure and unit-tested). The keys act in every mode
+  (Edit, Split, Preview, focus mode) and in document windows, wherever the
+  focus is, caught in the capture phase so the editor never types them;
+  not under a dialog or without a document (CodeMirror binds none of them;
+  the WebView's own zoom hotkeys stay off; the default macOS menu has no
+  zoom items). A key held down zooms one step. The permanent "− 100% +"
+  control is gone: the new level shows for 1 s centred near the top of the
+  content (`.zoom-indicator`, over the preview or the editor, over both
+  panes in Split), then fades (at once with reduced motion); it never takes
+  the pointer and is a polite live region ("Zoom 110%"). After a click in an
+  HTML page the frame keeps the keys; the 250 ms poll that gave them back
+  in focus mode now runs whenever a page is shown (Split, Preview), so the
+  zoom keys, Cmd+S and Cmd+Shift+V work again after a click in a page,
+  except while text is selected in it (so Copy works).
+- **How.** The HTML page gets CSS `zoom` on its root, one rule in the style
+  element the preview already puts in the frame, so the text stays crisp,
+  re-flows and `#id` jumps still land (checked in WKWebView and Chromium).
+  WebKit and Chromium scale the frame's scrollbar with that zoom, so the
+  scrollbar sizes are divided by it. The editor and the Markdown preview
+  share one custom property, `--content-zoom`, set on `.editor-host` and
+  `.preview` (not on a shared parent, which would restyle the outline's
+  rows): font size, spacing and the readable width scale (no transform);
+  CodeMirror re-measures its lines (`requestMeasure`, its box did not
+  change). Each shown pane keeps its reading position (editor top line,
+  preview block). One level for every window, saved 500 ms after the last
+  change with `layout_set({ preview_zoom })` (50–200, integer; the config
+  key keeps its name; document windows may call `layout_set` for this) and
+  read back by `config_get` and `document_window_info`. Measured in the
+  scratch WKWebView build: zoom steps on the 12 MB Markdown document in
+  Edit and Split, longest frame 21 ms (the editor lays out only what is in
+  view).
+- **Cost.** A zoom step is one re-flow of the preview. For a 12 MB HTML page
+  (152,000 elements) that is about 0.55 s in WKWebView (style 150 ms, layout
+  365 ms; Chromium about 0.6 s), the same work as resizing the pane. The
+  page therefore re-flows in the task after the next paint: the level, the
+  editor and a Markdown preview show one frame after the key (about 10 ms,
+  was 0.58 s, real key events in a WKWebView harness), and the page follows
+  about 0.58 s after the key, keeping its scroll ratio. A key held down
+  zooms one step (one re-flow); taps that queue up behind a re-flow are
+  dispatched together and share the next one (three quick taps: two
+  re-flows).
+- **Not under 200 ms.** Measured on the same page in WKWebView (2026-10-05):
+  `zoom` as an inline style on the root or body, or by editing the CSSOM
+  rule, costs the same 540–585 ms (every element's style depends on the
+  zoom); `transform: scale()` on the root with a matching width cuts it to
+  about 270 ms (layout only) but makes the root the containing block of
+  fixed elements; CSS `zoom` on the `<iframe>` does not scale the page in
+  WebKit; `content-visibility: auto` on the page's blocks hung WKWebView
+  (and its containment changes how arbitrary pages lay out: fixed elements,
+  counters, floats, margins). None is used; the 0.55 s re-flow of a page
+  this size is the limit.
+
+## Editor: CodeMirror 6 instead of Monaco (owner decision, 2026-10-05)
+
+Plan item D1, approved by the owner ("best performance and smallest
+footprint"). `src/editor/editor.ts` is the editor; Monaco's features were
+ported as listed below.
+
+- **Dependencies** (exact pins; `npm audit` 0; no `codemirror`/basic-setup
+  bundle, no `language-data`, no lint or completion UI):
+  - `@codemirror/state` 6.7.6: document state, transactions, compartments.
+  - `@codemirror/view` 6.43.13: the view; lays out only the lines in view.
+  - `@codemirror/commands` 6.11.1: the standard keys and undo history.
+  - `@codemirror/language` 6.12.4: highlighting, bracket matching, indent unit.
+  - `@codemirror/lang-markdown` 6.5.2: Markdown (GFM) parsing, list keys.
+  - `@codemirror/lang-html` 6.4.12: HTML, with its CSS and JavaScript.
+  - `@codemirror/lang-css` 6.3.1 and `@codemirror/lang-javascript` 6.2.5:
+    fenced css/js/ts code; lang-html already bundles them (no extra bytes).
+  - `@codemirror/search` 6.7.2: find and replace (Cmd/Ctrl+F).
+  - `@codemirror/autocomplete` 6.20.3: only `closeBrackets` (bracket
+    pairing); lang-markdown and lang-html already depend on it.
+  - `@lezer/highlight` 1.2.5: syntax tags and the class highlighter.
+- **One view, one state per document.** Each document keeps its
+  `EditorState` (text, selection, undo history, scroll) in an LRU of 10
+  documents and at most 24 Mi characters besides the open one; a rename,
+  move or conflict copy keeps it under the new id. Another window's text
+  starts a new history; caret and scroll follow the changed span
+  (`textChange`). `holds()` compares a kept document with
+  the opened text piece by piece, without a copy.
+- **Styling only in theme.css.** A `tagHighlighter` names `tok-*` classes,
+  theme.css colours them with the `--md-*` / `--code-*` tokens (Obsidian's
+  source mode), so dark, light and the accent follow live; `setTheme` is in
+  `theme.ts`. CodeMirror's layout styles
+  (a `<style>` element, allowed by `style-src 'unsafe-inline'`) carry one
+  generated class, so the rules in section 9 carry one class more.
+- **Readable width** is a margin on `.cm-content` (at least `--file-margins`,
+  centred at `--file-line-width`), not padding, so CodeMirror's wrapping
+  estimates use the real column. A click in a margin puts the caret on that
+  line (start of line on the left).
+- **Soft wrap** is `EditorView.lineWrapping` in a compartment, toggled by
+  Alt+Z and **Wrap**. CodeMirror wraps only the lines it lays out, so no wrap
+  column, strategy or deferred re-wrap is needed. Documents of 2 MB and more
+  are plain text (no parsing or highlighting).
+- **Pasted images fold.** A data URL's base64 of 4,096 characters or
+  more shows as one atomic mark ("⋯ 2.4 MB"); the text is unchanged. Folds
+  are found once per state (only tree leaves of 4,096+ characters are read)
+  and then only on edited lines. Without them an image was one huge line:
+  CodeMirror lays out an overlong wrapped line in full the first time
+  (about 0.1 s per 1M characters; 1.6 s for 12 MB in Chromium).
+- **Overlong lines stay unwrapped.** A document with a line of 512K
+  characters or more outside folds opens unwrapped and **Wrap** says why.
+  Cause: the `ViewState` constructor draws line gaps horizontally
+  (`gap.draw(this, false)`), so the first wrapped measure takes the partial
+  line's height and renders the whole line. Redrawing the gaps from outside
+  made scrolling worse in a trial, so CodeMirror is not patched; worth an
+  upstream report.
+- **Keys.** Standard keymap, history, search and bracket keys. Tab inserts
+  the document's indentation (a selection indents), Shift+Tab outdents,
+  Esc then Tab leaves the editor; Alt+click adds a caret and Alt+Shift+drag
+  selects a column (`rectangularSelection`). The indentation is detected
+  when a document opens: a tab when more of the first 10,000 lines start
+  with one than with spaces, else 2 or 4 spaces by the commoner step. As in
+  Obsidian and VS Code, Enter continues Markdown lists
+  and Backspace removes an empty item's marker, `(` `[` `{` pair (quotes too
+  in HTML, not `<`), HTML closes tags, a URL pasted over selected text
+  becomes a Markdown link. App keys (Alt+Z, F9, Cmd+Shift+V, zoom) still
+  run first, in the capture phase.
+- **Read-only** is `EditorState.readOnly`, and a `changeFilter` refuses every
+  change of a read-only state whatever made it: lang-markdown's Enter and
+  Backspace commands and its URL paste never check the facet, so in the main
+  window (read-only while a document window writes) they reached the save
+  model, failed with `NOT_WRITER`, blocked the next switch, and on lock or
+  quit wrote the stale copy over the window's newer text. A refused
+  keystroke, paste, cut or drop shows a note at the caret. An image pasted
+  or dropped on a read-only document is refused before it is encrypted.
+  Text dragged within the editor moves:
+  `navigation.ts` lets drops on `.cm-content` through when they carry no
+  files, and the editor refuses anything without text.
+- **Not ported:** Monaco's ambiguous-character (homoglyph) highlighting.
+  Control, zero-width and bidi characters show (`highlightSpecialChars`
+  plus LRE, RLE, PDF, FSI and the word joiner, which its list lacks, so
+  every "Trojan Source" control is marked).
+- **CSP:** `worker-src 'none'` (no worker); the e2e test
+  checks that styles apply (a `<style>` element and a constructed sheet)
+  and that a worker is blocked (the constructor throws, or the policy
+  reports and the worker errors) and never runs.
+- **Measured** (scratch universal build in WKWebView, the baseline's harness
+  and documents; two runs, the second with the display at 30 Hz):
+  main JS 2,902,661 → 735,001 B (240,964 gzip -9), worker 303,930 → 0,
+  CSS 160,329 → 76,369 B, dist 3,843,993 → 1,274,272 B; universal binary
+  15,263,504 → 14,197,520 B. WebContent memory (RSS / footprint) idle
+  242.7 / 103.6 → 78 / 48 MB, 1 MB open 318.7 / 191.0 → 95–101 / 74 MB,
+  12 MB open 393.7 / 137.2 → 192–198 / 94–96 MB. Open to editor paint
+  small / 1 MB / 12 MB 88 / 107 / 216 → 12–25 / 41–45 / 193–198 ms (12 MB:
+  `doc_open` is 170 ms of it); switch 90 / 49 / 64 → 17 / 21 / 53–69 ms.
+  Typing in 1 MB: p95 22 → 17–18 ms. 12 MB Markdown, the image note (11 MB
+  line), a 12 MB one-line page and a 12 MB page: longest frame on open or
+  switch 24–46 ms (up to 161 ms before `holds()`), wrap toggles 1–39 ms,
+  scrolling 60 fps (30 at 30 Hz); typing in 12 MB p95 21 ms. Cold start to
+  the vault tree 601 → 562 ms (median of 6).
+  Not better: preview scrolling in Split (13–17 fps), Preview→Split with a
+  rendered 1 MB preview (327–420 ms) and the outline toggle with it
+  (226–319 ms, baseline 137–256); the 37,915-node preview reflows in each
+  (not broken down yet).
+- **Parity check (2026-10-05).** Checked in browser mode (Chromium) and in
+  the scratch WKWebView build
+  with real key events (NSEvent / CGEvent through `NSApp`): undo kept across
+  open, switch, rename and move; read-only (with its note) while another
+  window writes the document, writable again when it closes; Trash items
+  are never opened for editing (Restore first) and trashing the open
+  document closes it; Option/Alt+Z, also as QWERTZ sends it; Cmd+S
+  (`doc_stage`, `doc_commit`); Cmd+Shift+V without pasting; F9 and Esc;
+  outline jumps in Edit, Split and Preview; `#heading`, `[[wiki]]` and
+  relative document links; image paste and drop insert Markdown at the
+  caret / drop point; HTML highlighting; find and replace; selection word
+  count; 12 MB documents; CR and CRLF become LF; Option+E then E composes
+  "é" and an input method's marked text commits; `spellcheck`,
+  `autocorrect` and `autocapitalize` are off. The e2e suite ran on Linux
+  (WebKitGTK, tauri-driver); macOS has no tauri-driver backend.
+
+## Footprint and hot paths (2026-10-05)
+
+Owner direction: a working app first, then speed, then size. Each change was
+measured against the build before it: a scratch universal build (scratch
+identifier and HOME, fake S3 on loopback) driven in WKWebView with real key
+events. The drivers and logs are in the scratchpad, not in the repo.
+
+- **No bundled fonts.** The 14 Inter woff2 files (452,780 B) were never
+  loaded on macOS or Windows: the stack starts with the system UI font
+  (0 font requests and 0 loaded faces in WKWebView). Linux now falls back to
+  the desktop's sans-serif. In WebKitGTK it renders in DejaVu Sans, which is
+  readable (screenshot of the browser-mode build in the Linux e2e image).
+  The OFL text went with the files. dist 1,273,422 → 815,016 B (19 → 5
+  files); universal binary 14,197,520 → 13,302,560 B (arm64 6,726,416 →
+  6,273,824; with the strip change below), app 14,072 → 13,196 KB. Cold
+  start is unchanged: median 590 vs 584 ms over 6 interleaved runs.
+- **CSS.** `contain: paint` on `.preview` gives the pane its own composited
+  scroller. Without it, WebKit repainted the preview and the editor together
+  in Split on every scroll step. With a 1 MB rendered preview: preview scroll
+  in Split went from 17–18 to 60 fps (from 118–125 dropped frames in 3 s to
+  0), editor scroll from 35 to 60 fps, Split → Preview from 246–282 to
+  87–112 ms, Preview → Split from 315–352 to 84–107 ms, and outline
+  open/close from 228–260 / 169–190 to 184–200 / 143–144 ms. `contain:
+  layout paint` and `strict` measured the same, and so did containment on
+  the editor or the outline, so only `paint` is kept. Also removed: dead
+  rules (`.empty-card`, `.inline-title`), 25 unused tokens and the
+  reduced-motion `scroll-behavior` (nothing scrolls smoothly any more). CSS
+  76,146 → 70,526 B. Kept, because measuring showed no cost: the
+  task-list `:has()` rules (inserting a 1 MB preview with 5,945 task items
+  took 376 vs 374 ms without them), and the shadows (menus, modals and the
+  narrow-window outline drawer only, never on a scrolling surface).
+- **Instant jumps.** `scrollPaneTo` sets `scrollTop`. A `#heading` click in
+  a 500 KB preview took 240–256 ms over 7–13 frames of smooth scrolling and
+  now takes 11–14 ms in one frame (Split and Preview).
+- **Large texts are staged less often.** Over 2 Mi characters (UTF-16
+  units, read from the editor in O(1)), the outbox write waits for a 5 s
+  pause instead of 1 s. Switch, Cmd/Ctrl+S, blur, close, lock and every
+  upload still write it at once (unit tests). Each stage sends the whole
+  text: 12 MB is 12.95 MB of JSON, 152–173 ms round trip, and 2–3 frames
+  over 50 ms on the main thread (`toString` 4–6 ms, `JSON.stringify` 11–12
+  ms, then the request body). Typing in four bursts with 1.6 s pauses: 4
+  stages (51.8 MB) → 0, longest frame 56–60 → 31 ms. The 1 MB document
+  still stages after 1 s. The whole session went from 56.7 to 17.8 MB of
+  `doc_stage`. Incremental (diff) staging was not done: Rust would have to
+  rebuild the text from UTF-16 offsets and could drift silently.
+  Raw-bytes IPC would save only the 12 ms stringify.
+- **Hardware AES on Apple silicon.** `aes` 0.8 and `polyval` 0.6 use the
+  ARMv8 instructions only with `--cfg aes_armv8 --cfg polyval_armv8`.
+  Without them every content encryption and decryption used the software
+  fallback. `.cargo/config.toml` sets both for aarch64 macOS and Linux (the
+  instructions are detected at runtime, with the fallback kept), and
+  `sha2` is built at opt-level 3. Measured on a 12 MB text: encrypt 77 →
+  20 ms, decrypt 83 → 26 ms, SHA-256 48 → 21 ms, with no change in size. In
+  the app: the first open of a 12 MB document went from 170–172 to 87–89 ms
+  of `doc_open` (193–195 → 111–128 ms to the editor's paint), a 12 MB page
+  from 169 to 79–84 ms, a 1 MB document from 30 to 10–17 ms, and a 12 MB
+  stage from 152–159 to 72–83 ms, and a 1 MB stage from 18–37 to 20–21 ms.
+  Unlock with the remembered phrase is SHA-bound (PBKDF2-HMAC-SHA256,
+  3 × 120,000 rounds), so cold start to the vault tree went from 496–507
+  to 400–413 ms (6 interleaved runs). `sha2` 0.11, already in the graph for
+  rusty-s3, uses the SHA instructions (4.3 ms), but `pbkdf2` 0.12 needs
+  0.10, so that waits for its upgrade.
+- **Stripping that does not depend on PATH.** The rustc strip step runs
+  rust-objcopy, which needs rustup's environment to find libLLVM.dylib.
+  Outside it, rustc only warned and shipped an unstripped binary (arm64
+  9,488,936 B instead of 6,748,352 B). On macOS the linker now strips
+  (`-Wl,-S -Wl,-x` from `build.rs`, release bins only, so dev builds keep
+  their symbols). The rustc step is off there (`-C strip=none` in
+  `.cargo/config.toml`, at the repo root so cargo runs from `src-tauri`, as
+  the Tauri CLI does, and from the root, as CI does, both read it). Build
+  scripts are not stripped. Result: 6,755,448 B through a rustup proxy and
+  without one, and no warning. That is 7 KB more than objcopy's
+  `--strip-all`. x86_64 is 7,389,952 B. Linux and Windows keep rustc's
+  link-time strip.
+- **Release profile, measured (arm64).** `s` 6.76 MB, 1 MB preview render 39
+  ms. `z` 5.45 MB, render 107 ms. `z` with the hot crates at 3: 5.61 MB,
+  but crypto twice as slow and everything else unmeasured at `z`. `3`
+  8.31 MB, render 33 ms, encrypt 11 ms. `s` with the Markdown and sanitizer
+  crates at 3: +66 KB for a 13% faster render. `s` with LTO,
+  codegen-units 1 and `panic = "abort"` stays. The only new override is
+  `sha2` at 3. Duplicate crates in the graph (html5ever 0.39/0.40,
+  digest 0.10/0.11, base64 ×3) come from Tauri and rusty-s3. Every direct
+  dependency is used, and so is every feature turned on (see "Cleanup").
+- **Preview of long Markdown.** Typing in Split on a 500 KB document (just
+  under the 512 KB pause) costs one `preview_render` of 528 KB → 824 KB in
+  22–36 ms, and the block patch keeps the longest frame at 34–40 ms with
+  no frame over 50 ms. So nothing is virtualised. A full 1 MB render is
+  367–443 ms, almost all of it WebKit's style and layout of 38k nodes.
+  `content-visibility` was ruled out earlier: it hung WebKit for minutes on
+  62k blocks.
+- **120 Hz: not enabled.** WebKit caps page rendering updates (rAF) at 60
+  Hz through the internal feature `PreferPageRenderingUpdatesNear60FPSEnabled`.
+  It is on by default, and only the private `_setEnabled:forFeature:` can
+  turn it off (`-[WKPreferences _setPreferPageRenderingUpdatesNear60FPSEnabled:]`
+  does not exist on macOS 26.6). The condition was not met: nothing here
+  was measurably capped. Both displays run at 60 Hz (the built-in one could
+  do 120 but is set to 60, and changing that is a system setting), and rAF
+  ran at 60.3–60.5 fps, which is the display's rate. Scrolling, the main
+  thing a higher rate would improve, is composited by WebKit off the main
+  thread, and nothing in the app animates through rAF any more. Revisit
+  with a 120 Hz display, in a separate small crate behind runtime
+  `respondsToSelector:` checks, keeping `#![forbid(unsafe_code)]` in the
+  app crate.
+
+## Review fixes: read-only, saves, outline, switches (2026-10-05)
+
+Found by the parity, performance and security reviews of the CodeMirror and
+footprint steps; each was reproduced before it was fixed.
+
+- **Read-only, indentation, column selection, bidi:** see the CodeMirror
+  section (Read-only, Keys, Dropped). Unit tests run lang-markdown's own
+  commands on a read-only state.
+- **Staging has an upper wait.** Typing that never pauses for the stage delay
+  (1 s, or 5 s over 2 Mi characters) is staged 10 s after its first unstaged
+  edit (`maxStageWaitMs`). Before, a large document typed with 2–4 s pauses
+  reached the outbox only at the 120 s upload, a blur or a switch, so a
+  crash could lose two minutes. A 12 MB text costs one stage (about 80 ms)
+  per 10 s of such typing.
+- **The outline is bounded.** It drew every heading as nested DOM with a
+  listener per row and kept it while hidden: on a 12 MB document (36,170
+  headings, 168,796 nodes) opening took 1.4 s, the next editor focus froze
+  WebKit for 9.9 s, the first key for 14.8 s, and footprint rose by about
+  1 GB. Now rows are flat (`role="treeitem"` with `aria-level`, the same
+  look), drawn 400 at a time (more as the end nears the view, an
+  `IntersectionObserver`), one delegated click listener reads the row's
+  index, a redraw is skipped when the document and its headings (level,
+  line, text) are unchanged, and hiding the outline drops its rows. A fold
+  keeps the rows drawn and the focus on its button. Measured (scratch build,
+  real keys, two runs): 12 MB open 1,368–1,464 → 115–123 ms (1,802 nodes),
+  no frame over 50 ms on focus, the first key's longest frame 14.8 s → 112
+  ms, 27 of 27 keys at 100 ms painted with p95 19–22 ms (before: 2–5
+  arrived), WebContent footprint with it open 987–1,429 → 121–126 MB; 1 MB
+  open 134–161 → 43 ms, typing p95 45–51 → 19 ms, and with its preview
+  rendered, outline open / close 134–136 / 66–68 → 40–45 / 14–15 ms. Still: each typing pause
+  that changes a heading of a 12 MB document costs one 110–125 ms frame
+  (the text is parsed again).
+- **A switch back sends no text.** `doc_open(id, known_rev)` returns
+  `text: null` when `known_rev` is the SHA-256 (hex) of the text it would
+  return; `doc_stage` returns that rev too. The editor keeps the rev of the
+  text a kept state was opened or staged with (staged: only when the state
+  still holds exactly that text, `holds()`), and drops it at the first edit.
+  Being a content hash, the rev needs no bookkeeping across windows, S3
+  versions or conflict copies: any other text has another rev and is sent.
+  The SHA-256 is already computed for every staged and cached text, so a
+  rev costs nothing. Before, each switch back to a 12 MB document sent
+  12.9 MB of JSON and allocated it twice. Measured: the reply is 143 B
+  instead of 12,951,032 B, also after an edit and a switch away; a switch
+  back to the 12 MB document paints in 18–26 ms (41–60 before), like the
+  small one, and the app process no longer saw-tooths (footprint at most
+  89 MB in a 10-switch loop, falling to 38; it climbed to 156 MB before).
+- **Find panel.** A paste or drop in CodeMirror's find panel (inside
+  `.editor-host`) no longer goes to the image handlers: an image on the
+  clipboard was encrypted and inserted into the document instead of the
+  search field.
+
+## Cleanup (2026-10-05)
+
+Behaviour unchanged; everything below was unused.
+
+- **Rust.** The spec's research modules `crypto/`, `vault/` and `store/`
+  (never in the module tree) and the empty `sync/` and `render/` are gone,
+  and with them the direct dependencies `aes-gcm`, `argon2`, `bytes`, `hkdf`
+  and `hmac` and the unused features `serde` of secrecy, url and uuid and
+  `attributes` of tracing (Cargo.lock: 592 → 586 packages). The commands
+  `connection_test` and `search_titles`, which no page called, are removed
+  with their permissions, so the main window's capability is two commands
+  smaller. `compat` is private, which showed `decode_listing` unused; it
+  went with its test.
+- **Frontend.** Removed `Toasts`, `Modals`, `formatBytes`, `formatDate`,
+  `plural` and `clear` (`ui/primitives.ts`), four icons nothing drew, the
+  `connectionTest` and `searchTitles` wrappers, the toast and `.modal-card` /
+  `.modal-choice` rules and the tokens only they read. main.ts reuses
+  folder-import.ts's `uniqueName` (`toLowerCase`, as the backend's
+  `to_lowercase`; its own copy used `toLocaleLowerCase`). Exports used only
+  inside their module are no longer exported. Main JS 738,866 → 738,072 B,
+  CSS 70,551 → 68,662 B, dist 819,427 → 816,744 B.
+- **Repository.** Removed the empty `benches/`, the `.env.example` for AWS
+  tests that do not exist, the Android, iOS and Windows Store icons and the
+  512 px `icons/icon.png` (only the five icons `tauri.conf.json` lists are
+  bundled; the Unix window icon is the first PNG there, `32x32.png`).
+
+## Guards: leakage scan and budgets in CI (2026-10-05)
+
+- **Leakage scan (spec section 16).** `scripts/leak-scan/leak-scan.mjs`
+  (Node, no dependencies) searches files for canaries as UTF-8, UTF-16LE,
+  UTF-16BE, hex and base64 (both alphabets, all three alignments); exit 1 on
+  a hit, exit 2 when a file could not be read (it was never searched;
+  `--allow-unreadable` lists it and passes). Compressed data is not
+  unpacked. `tests/leak/session.test.mjs` (`npm run test:leak`, CI job
+  "Leak scan (Linux)") runs a scripted session with random canaries in a
+  folder name, a document name, three edits, the S3 secret key and the
+  remembered phrase: connect, create, save, preview, an edit staged while
+  the fake S3 drops connections, lock, unlock with the remembered phrase,
+  read back, Trash, restore, lock, quit. While locked the outbox and
+  `secrets.json` must hold no canary in any encoding. After shutdown none
+  may be in the whole throwaway profile: config, secrets, outbox, WebView
+  data and caches, GPU shader cache, temp, the keyring and
+  `XDG_RUNTIME_DIR` (the test points it into the profile for the app, its
+  D-Bus bus, the keyring and the portal and accessibility services the bus
+  starts). None may be in new files in the system temp folders or the
+  caller's own `XDG_RUNTIME_DIR`, the captured tauri-driver and app output,
+  or any raw bucket object. Every file in the profile must have been
+  readable; unreadable files in the shared temp folders (other users'
+  `systemd-private-*`) are only counted. A positive control (a build that
+  copied each staged text into `localStorage`) failed it with
+  UTF-16LE hits in WebKit's localstorage file. Linux only: tauri-driver has
+  no macOS backend, and on Windows the app's config folder cannot be
+  redirected. It runs the debug build, the only one that accepts a loopback
+  `http://` endpoint (the fake S3 is in the test, `tests/leak/fake-s3.mjs`).
+  The app stores the secrets file's master key in a Secret Service, so the
+  test starts its own D-Bus session bus and gnome-keyring (with a password,
+  so the login collection exists) inside the profile and waits for the name
+  before asking for it (asking earlier starts a second, passwordless keyring
+  through D-Bus activation); the app never reaches a developer's real
+  keychain. `tests/e2e/driver.mjs` holds the tauri-driver session code that
+  the smoke test and this test share.
+- **Size budgets.** `scripts/check-budgets.mjs` (`npm run check:budgets`,
+  Linux CI after the build): main JS 808,000 B, boot chunk 10,200 B, CSS
+  77,600 B, `dist/` 896,500 B, the overhaul's sizes plus about 10%; any
+  other file in `dist/` (a worker, font, source map or extra chunk) or a
+  `new Worker`, `importScripts` or service worker registration in the JS
+  fails it.
+- **S3 request budgets** (`src-tauri/tests/s3_budget.rs`) run in every
+  CI `cargo test` on all three OSes.
+- **No typing or scrolling metric in CI.** Hosted runners render WebKitGTK
+  in software under Xvfb on shared CPUs; frame times there vary more than
+  the regressions worth catching (typing p95 is 17–20 ms on a Mac), so a
+  budget loose enough not to flake would catch nothing. They are measured
+  with a scratch macOS build.
+
+## Web version (`web/`, 2026-10-11)
+
+A minimal, mobile-first static site that opens the same workspaces as the
+desktop app (web/README.md). The desktop's `index.html`, `src/boot.ts`,
+`src-tauri/` and existing modules are unchanged; the site imports them.
+
+- **Structure**: `web/` has its own `index.html`, entry and Vite config
+  (`npm run build:web` → `dist-web/`, `npm run dev:web`). No server code.
+- **Codec**: `web/src/codec.ts` ports `compat/notebook_v1.rs` (PBKDF2 via
+  WebCrypto, Rust `str::trim` semantics, strict base64url). AES-256-GCM-SIV
+  comes from `@noble/ciphers` 2.4.0 (pinned): independently audited (Cure53,
+  2024, on 1.0.0), no dependencies, small, and WebCrypto has no GCM-SIV. Compatibility
+  is proven both ways by committed vectors (`tests/web/fixtures/`, written by
+  each codec and checked by the other: `tests/web/codec.test.mjs`,
+  `src-tauri/tests/web_compat.rs`, which compiles the real codec file with
+  `#[path]` so `src-tauri/src` stays untouched) and by the MinIO run.
+- **Markdown**: `marked` 18.0.14 + `DOMPurify` 3.4.16 (pinned; DOMPurify was
+  already vetted for the Monaco build) configured to `preview.rs`'s allowlist,
+  with the desktop's `vault-links.ts` hrefs and `h-<slug>` ids. pulldown-cmark
+  is not available in the browser; differences (footnotes, bare-URL
+  autolinks) are listed in web/README.md.
+- **S3**: a ~150-line SigV4 header signer (WebCrypto HMAC) instead of the
+  AWS SDK, checked against AWS's signing test suite and S3's documented
+  examples. Conditional PUTs as on the desktop; a conflict keeps the user's
+  text as `Name (conflict <ms>).md` (desktop `conflict_path`), never
+  overwrites. The bucket needs a CORS rule exposing `ETag`.
+- **Config**: localStorage holds the desktop `config.json` v2 object and a
+  `secrets.json`-shaped object whose values are AES-GCM-sealed under a
+  non-extractable IndexedDB key, AAD = the desktop's secrets context. It
+  protects copies of the profile, not same-origin script (documented threat
+  model). "Remember" off stores no secret. One workspace per browser.
+- **Editor**: loaded with a dynamic import on the first Edit: the reading
+  bundle is ~158 KB (54 KB gzip), CodeMirror ~552 KB (192 KB gzip) on demand.
+- **CSP**: `<meta>` policy built by `web/vite.config.ts` (`connect-src` =
+  `'self'`, AWS and `NOTEBOOK_WEB_CONNECT_SRC`), repeated with
+  `frame-ancestors` in a generated `dist-web/_headers`; nginx sample in
+  `web/deploy/`. `style-src 'unsafe-inline'` as on the desktop (CodeMirror).
+- **Not included**: Trash, rename, move, delete, import, image paste,
+  workspace manager, settings UI, auto-lock, outline, offline outbox.
+- **Tests**: `npm run test:web` (Node), `npm run test:web:browser`
+  (Playwright, sanitizer corpus), `npm run test:web:e2e` (MinIO in Docker,
+  Chromium and WebKit at three sizes, desktop codec on both ends).
+  `playwright-core` 1.59.1 is a dev dependency (matches the cached
+  Chromium 1217); browsers are installed with `npx playwright-core install`.

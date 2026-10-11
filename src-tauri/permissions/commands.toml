@@ -38,11 +38,6 @@ description = "Save the sidebar and outline widths and the Split ratio with the 
 commands.allow = ["layout_set"]
 
 [[permission]]
-identifier = "allow-connection-test"
-description = "Test the configured S3 index object."
-commands.allow = ["connection_test"]
-
-[[permission]]
 identifier = "allow-vault-unlock"
 description = "Unlock the active workspace with a typed or remembered phrase, remembering or forgetting it."
 commands.allow = ["vault_unlock"]
@@ -108,11 +103,6 @@ description = "Permanently delete all Trash entries."
 commands.allow = ["trash_empty"]
 
 [[permission]]
-identifier = "allow-search-titles"
-description = "Search encrypted-index titles in memory."
-commands.allow = ["search_titles"]
-
-[[permission]]
 identifier = "allow-doc-open"
 description = "Open and decrypt a document in memory."
 commands.allow = ["doc_open"]
@@ -149,10 +139,40 @@ commands.allow = ["link_open"]
 
 [[permission]]
 identifier = "allow-close-after-flush"
-description = "Close the main window once a pending close has saved the open document."
+description = "Close the calling window once a pending close has saved its open document."
 commands.allow = ["close_after_flush"]
 
 [[permission]]
 identifier = "allow-cancel-close"
 description = "Cancel a pending guarded close after a save failure."
 commands.allow = ["cancel_close"]
+
+[[permission]]
+identifier = "allow-open-document-window"
+description = "Open a document in a window of its own, which then writes it (main window only)."
+commands.allow = ["open_document_window"]
+
+[[permission]]
+identifier = "allow-document-windows-close"
+description = "Save and close every document window before a lock, switch or quit (main window only)."
+commands.allow = ["document_windows_close"]
+
+[[permission]]
+identifier = "allow-document-window-close"
+description = "A document window closes itself (its Close window button), through the close guard."
+commands.allow = ["document_window_close"]
+
+[[permission]]
+identifier = "allow-document-window-info"
+description = "Read which document the calling document window holds, checked by its label and session."
+commands.allow = ["document_window_info"]
+
+[[permission]]
+identifier = "allow-document-link-open"
+description = "Ask the main window to open a vault document linked from the calling document window's preview, resolved from that window's document."
+commands.allow = ["document_link_open"]
+
+[[permission]]
+identifier = "allow-document-window-flushed"
+description = "Report that the calling document window wrote its pending edit to the outbox."
+commands.allow = ["document_window_flushed"]

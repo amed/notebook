@@ -1,4 +1,4 @@
-export interface VaultFilePath {
+interface VaultFilePath {
   directories: string[];
   name: string;
   absolute: string;

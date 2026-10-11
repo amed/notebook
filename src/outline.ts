@@ -73,18 +73,43 @@ export function parseMarkdownOutline(markdown: string): OutlineItem[] {
   return roots;
 }
 
-function headingText(source: string): string {
+/** A code span (kept verbatim) or a backslash escape (its character), as CommonMark reads them. */
+const CODE_OR_ESCAPE = /(?<!`)(`+)(?!`)([\s\S]+?)(?<!`)\1(?!`)|\\([!-/:-@[-`{-~])/g;
+/** Stands for the code span or escape with the number between the marks while the rest is stripped. */
+const PROTECTED = /\uE000(\d+)\uE001/g;
+
+/**
+ * The label of a heading's source, close to the text the preview renders
+ * (main.ts derives heading ids from it, as preview.rs does from the
+ * rendered text): code spans and escaped characters verbatim; links and
+ * images give their text; tags and emphasis delimiters go. A `_` inside a
+ * word is no delimiter (CommonMark), so `parse_config` keeps it.
+ */
+export function headingText(source: string): string {
+  const kept: string[] = [];
+  const protect = (text: string): string => `\uE000${kept.push(text) - 1}\uE001`;
   return source
     .trim()
+    .replace(/[\uE000\uE001]/g, "")
+    .replace(CODE_OR_ESCAPE, (_match, _run, code: string | undefined, escaped: string | undefined) =>
+      protect(escaped ?? codeSpanText(code ?? "")))
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/<[^>]*>/g, "")
-    .replace(/[`*_~]+/g, "")
+    .replace(/[*~]+/g, "")
+    .replace(/(?<![\p{L}\p{N}_])_+|_+(?![\p{L}\p{N}_])/gu, "")
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/\s+/g, " ")
-    .trim();
+    .trim()
+    .replace(PROTECTED, (_match, index: string) => kept[Number(index)] ?? "");
+}
+
+/** A code span's text: one space trimmed from each end when both have one (CommonMark). */
+function codeSpanText(code: string): string {
+  const text = code.replace(/\r?\n/g, " ");
+  return /^ [\s\S]* $/.test(text) && /[^ ]/.test(text) ? text.slice(1, -1) : text;
 }

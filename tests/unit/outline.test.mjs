@@ -54,3 +54,10 @@ test("does not mistake a horizontal rule after an ATX heading for Setext", () =>
     { level: 1, text: "Heading", line: 1, children: [] },
   ]);
 });
+
+test("keeps underscores inside words, code spans and escapes in labels", () => {
+  const labels = parseMarkdownOutline(
+    "## parse_config\n## _emphasis_ and __strong__\n## `__init__` and `` a ` b ``\n## \\_literal\\_ \\`tick\\`\n## [`code`](https://example.test)",
+  ).map((item) => item.text);
+  assert.deepEqual(labels, ["parse_config", "emphasis and strong", "__init__ and a ` b", "_literal_ `tick`", "code"]);
+});

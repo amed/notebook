@@ -45,7 +45,7 @@ export const MIN_CONTENT = 400;
  * not read from matchMedia: WebKit answers a resize event with the previous
  * size's matches.
  */
-export const NARROW_MAX_WIDTH = 850;
+const NARROW_MAX_WIDTH = 850;
 const DIVIDER = 1;
 /** Arrow keys move a handle this far; with Shift, BIG_STEP. */
 export const STEP = 16;

@@ -56,13 +56,21 @@ jobs:
       # tauri::generate_context! embeds ../dist, so the frontend must exist before cargo runs.
       - run: npm run build
 
+      # Size budgets of the built frontend (scripts/check-budgets.mjs): main JS,
+      # boot chunk, CSS and dist total, no worker, font or extra chunk. Sizes are
+      # the same on every OS, so one runner checks them.
+      - run: npm run check:budgets
+        if: runner.os == 'Linux'
+
       # Frontend logic without a DOM; Node 22.18+ strips the TypeScript types.
-      - run: node --test "tests/unit/*.test.mjs"
+      - run: npm run test:unit
 
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all --check
 
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
 
+      # Includes tests/s3_budget.rs: the S3 request and connection budgets of
+      # the save model, against an in-process fake S3.
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
   audit:
@@ -160,3 +168,42 @@ jobs:
       - name: Run end-to-end tests (Windows)
         if: runner.os == 'Windows'
         run: npm run test:e2e
+
+  leak:
+    name: Leak scan (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # dbus and gnome-keyring: the test starts its own session bus and keyring.
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev pkg-config \
+            build-essential file curl xz-utils dbus webkit2gtk-driver xvfb gnome-keyring
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      # The debug build: only debug builds accept the test's loopback http:// fake S3.
+      - run: npm run tauri -- build --debug --no-bundle -- --locked
+
+      - run: cargo install tauri-driver --locked
+
+      # A scripted session with random canaries, then scripts/leak-scan/ over the
+      # profile, WebView data, outbox, secrets, temp folders, logs and bucket.
+      - run: xvfb-run -a npm run test:leak

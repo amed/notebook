@@ -34,7 +34,7 @@ export function countCharacters(text: string): number {
   return count;
 }
 
-export type TextCounts = { words: number; characters: number };
+type TextCounts = { words: number; characters: number };
 
 export function countText(text: string): TextCounts {
   return { words: countWords(text), characters: countCharacters(text) };

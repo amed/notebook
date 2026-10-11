@@ -10,8 +10,8 @@ import type {
   WorkspaceSummary,
 } from "./ipc";
 
-export const MAX_WORKSPACE_NAME = 64;
-export const DEFAULT_WORKSPACE_NAME = "Workspace";
+const MAX_WORKSPACE_NAME = 64;
+const DEFAULT_WORKSPACE_NAME = "Workspace";
 
 /** What the workspace forms collect. Secret fields left blank keep what is stored. */
 export interface WorkspaceFormValues {
@@ -27,7 +27,7 @@ export interface WorkspaceFormValues {
   remember: boolean;
 }
 
-export interface FormProblem {
+interface FormProblem {
   field: keyof WorkspaceFormValues;
   message: string;
 }
@@ -45,7 +45,7 @@ export interface WorkspaceStore {
   lock(): Promise<void>;
 }
 
-export type LaunchStep =
+type LaunchStep =
   /** No workspace yet: the first-run screen creates one. */
   | { kind: "setup" }
   /** Workspaces but none active (an earlier delete): make this one active. */
@@ -68,7 +68,7 @@ export function defaultWorkspaceName(bucket: string): string {
   return name || DEFAULT_WORKSPACE_NAME;
 }
 
-export function sameWorkspaceName(left: string, right: string): boolean {
+function sameWorkspaceName(left: string, right: string): boolean {
   return left.trim().toLowerCase() === right.trim().toLowerCase();
 }
 
@@ -284,7 +284,7 @@ interface MemoryWorkspace {
   queued: boolean;
 }
 
-export interface MemorySeed {
+interface MemorySeed {
   name: string;
   bucket: string;
   region: string;

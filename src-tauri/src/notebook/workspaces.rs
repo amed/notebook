@@ -1207,31 +1207,41 @@ pub fn workspaces_list(state: State<'_, NotebookState>) -> Result<WorkspaceList,
 
 #[tauri::command]
 pub async fn workspace_save(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
     workspace: WorkspaceInput,
 ) -> Result<WorkspaceSummary, IpcError> {
-    save_workspace(&state, workspace)
+    let result = save_workspace(&state, workspace);
+    crate::window::close_stale_document_windows(&app);
+    result
 }
 
 /// `leave_pending`: delete although edits queued for its location are not
 /// uploaded yet (they stay on this device); otherwise `OUTBOX_PENDING`.
 #[tauri::command]
 pub async fn workspace_delete(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
     id: String,
     leave_pending: Option<bool>,
 ) -> Result<WorkspaceList, IpcError> {
-    delete_workspace(&state, &id, leave_pending.unwrap_or(false))
+    let result = delete_workspace(&state, &id, leave_pending.unwrap_or(false));
+    crate::window::close_stale_document_windows(&app);
+    result
 }
 
-/// Ends the current session (the frontend flushes first) and makes `id` the
-/// active workspace. Selecting the active workspace changes nothing.
+/// Ends the current session (the frontend flushes and closes its document
+/// windows first) and makes `id` the active workspace. Selecting the active
+/// workspace changes nothing.
 #[tauri::command]
 pub async fn workspace_select(
+    app: tauri::AppHandle,
     state: State<'_, NotebookState>,
     id: String,
 ) -> Result<WorkspaceSummary, IpcError> {
-    select_workspace(&state, &id)
+    let result = select_workspace(&state, &id);
+    crate::window::close_stale_document_windows(&app);
+    result
 }
 
 /// Seals S3 credentials for the active workspace (tests of the validation).

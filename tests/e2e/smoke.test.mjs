@@ -9,28 +9,22 @@
 // Windows). Do not use TAURI_APP_PATH: tauri-cli reads it as the src-tauri directory.
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
-import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { Builder, By, until } from "selenium-webdriver";
+import { By, until } from "selenium-webdriver";
+import { TauriApp, tail, windows } from "./driver.mjs";
 
 const SETUP_TITLE = "Connect your encrypted workspace";
 const STARTUP_FAILURE = "could not start";
-const SESSION_TIMEOUT_MS = 60_000;
 const RENDER_TIMEOUT_MS = 60_000;
 const HOOK_TIMEOUT_MS = 180_000;
 const TEST_TIMEOUT_MS = 30_000;
 const APP_ORIGIN = /^(tauri:\/\/localhost|https?:\/\/tauri\.localhost)(\/|$)/;
 const BUILD_HINT = "`npm run tauri -- build --no-bundle`";
-const HEADLESS_HINT = "`dbus-run-session -- xvfb-run -a npm run test:e2e`";
 
-const windows = process.platform === "win32";
 const root = fileURLToPath(new URL("../..", import.meta.url));
 // src-tauri/tauri.linux.conf.json renames the Linux binary so it cannot clash with
 // the original Notebook app's /usr/bin/notebook.
@@ -44,137 +38,9 @@ const unsupported =
   process.platform === "darwin" && "tauri-driver has no macOS backend; use the manual checklist";
 const testOptions = { skip: unsupported, timeout: TEST_TIMEOUT_MS };
 
-let driverProcess = null;
-let driverLog = "";
+const app = new TauriApp(application);
 let session = null;
-let profile = null;
 let rendered = null;
-
-function freePort() {
-  return new Promise((resolvePort, reject) => {
-    const server = createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const { port } = server.address();
-      server.close(() => resolvePort(port));
-    });
-  });
-}
-
-// The app inherits this environment through tauri-driver and the native driver,
-// so its config, WebView data and caches live in a throwaway directory.
-function isolatedEnv(dir) {
-  const env = {
-    ...process.env,
-    HOME: dir,
-    XDG_CONFIG_HOME: join(dir, ".config"),
-    XDG_DATA_HOME: join(dir, ".local", "share"),
-    XDG_CACHE_HOME: join(dir, ".cache"),
-    XDG_STATE_HOME: join(dir, ".local", "state"),
-  };
-  if (windows) {
-    // Known-folder lookups ignore APPDATA, so only the WebView2 profile can be redirected.
-    Object.assign(env, { USERPROFILE: dir, WEBVIEW2_USER_DATA_FOLDER: join(dir, "WebView2") });
-  }
-  for (const key of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"]) {
-    mkdirSync(env[key], { recursive: true });
-  }
-  return env;
-}
-
-function tail(text, length = 4000) {
-  return text.length > length ? `…${text.slice(-length)}` : text;
-}
-
-function killDriver(signal) {
-  if (!driverProcess?.pid) return;
-  try {
-    // tauri-driver runs in its own process group, which also holds the native driver
-    // and the app it launched. On Windows its job object takes them down with it.
-    if (windows) driverProcess.kill(signal);
-    else process.kill(-driverProcess.pid, signal);
-  } catch {
-    // already gone
-  }
-}
-
-function within(promise, ms) {
-  let timer;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
-    }),
-  ]).finally(() => clearTimeout(timer));
-}
-
-async function startDriver(env) {
-  const port = await freePort();
-  const args = ["--port", String(port), "--native-port", String(await freePort())];
-  if (process.env.TAURI_NATIVE_DRIVER) args.push("--native-driver", process.env.TAURI_NATIVE_DRIVER);
-  const command = process.env.TAURI_DRIVER || "tauri-driver";
-  driverProcess = spawn(command, args, { env, detached: !windows, stdio: ["ignore", "pipe", "pipe"] });
-  const collect = (chunk) => {
-    driverLog = tail(driverLog + chunk, 64_000);
-  };
-  driverProcess.stdout.on("data", collect);
-  driverProcess.stderr.on("data", collect);
-  driverProcess.on("error", (error) => collect(`\n${error.message}\n`));
-  // A failed or timed-out hook must not keep the runner alive; the exit handler
-  // below still kills the driver.
-  driverProcess.unref();
-  driverProcess.stdout.unref();
-  driverProcess.stderr.unref();
-  const spawnError = once(driverProcess, "spawn").then(
-    () => null,
-    (error) => error,
-  );
-  const error = await spawnError;
-  if (error) {
-    throw new Error(
-      `could not run ${command} (${error.code}). Install it with \`cargo install tauri-driver --locked\` or set TAURI_DRIVER.`,
-    );
-  }
-
-  const url = `http://127.0.0.1:${port}`;
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if (driverProcess.exitCode !== null || driverProcess.signalCode !== null) {
-      throw new Error(`tauri-driver exited early (${driverProcess.exitCode ?? driverProcess.signalCode}):\n${tail(driverLog)}`);
-    }
-    try {
-      const response = await fetch(`${url}/status`, { signal: AbortSignal.timeout(2_000) });
-      if (response.ok) return url;
-    } catch {
-      // not listening yet
-    }
-    await new Promise((wait) => setTimeout(wait, 250));
-  }
-  throw new Error(`tauri-driver did not become ready within 30 s:\n${tail(driverLog)}`);
-}
-
-async function stopDriver() {
-  if (session) {
-    await within(session.quit(), 15_000).catch(() => {});
-    session = null;
-  }
-  if (driverProcess) {
-    const running = driverProcess.exitCode === null && driverProcess.signalCode === null;
-    const exited = running ? once(driverProcess, "exit") : Promise.resolve();
-    killDriver("SIGTERM");
-    if (!(await within(exited, 5_000).then(() => true, () => false))) {
-      killDriver("SIGKILL");
-      await within(exited, 5_000).catch(() => {});
-    }
-    // tauri-driver kills only its direct child; anything left in the group goes too.
-    if (!windows) killDriver("SIGKILL");
-    driverProcess = null;
-  }
-  if (profile) {
-    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-    profile = null;
-  }
-}
 
 function inPage(script) {
   return session.executeScript(script);
@@ -199,23 +65,6 @@ async function waitForFirstScreen() {
   return { ...last, timedOut: true };
 }
 
-function abandon() {
-  killDriver("SIGKILL");
-  try {
-    if (profile) rmSync(profile, { recursive: true, force: true });
-  } catch {
-    // best effort while exiting
-  }
-}
-
-process.once("exit", abandon);
-for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) {
-  process.once(signal, () => {
-    abandon();
-    process.exit(code);
-  });
-}
-
 before(
   async () => {
     if (unsupported) return;
@@ -231,29 +80,13 @@ before(
         `${realConfig} exists; on Windows the app's config folder cannot be redirected, so run this test on a clean profile (for example CI).`,
       );
     }
-    profile = mkdtempSync(join(tmpdir(), "notebook-e2e-"));
-    const server = await startDriver(isolatedEnv(profile));
-    const starting = new Builder()
-      .usingServer(`${server}/`)
-      .withCapabilities({ browserName: "wry", "tauri:options": { application } })
-      .build();
-    try {
-      session = await within(starting, SESSION_TIMEOUT_MS);
-    } catch (error) {
-      starting.then((late) => late.quit()).catch(() => {});
-      const display = !windows && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
-      throw new Error(
-        `could not start a WebDriver session: ${error.message}\n` +
-          (display ? `No display is set; on a headless Linux machine run ${HEADLESS_HINT}.\n` : "") +
-          `driver log:\n${tail(driverLog)}`,
-      );
-    }
+    session = await app.start();
     rendered = await waitForFirstScreen();
   },
   { timeout: HOOK_TIMEOUT_MS },
 );
 
-after(stopDriver, { timeout: HOOK_TIMEOUT_MS });
+after(() => app.stop(), { timeout: HOOK_TIMEOUT_MS });
 
 test("renders the setup screen on a fresh profile", testOptions, async () => {
   const { url, text, error, timedOut } = rendered;
@@ -265,7 +98,7 @@ test("renders the setup screen on a fresh profile", testOptions, async () => {
       (timedOut
         ? "A binary built with plain `cargo build` or `tauri dev` loads the Vite dev URL instead of the bundled frontend.\n"
         : "") +
-      `driver log:\n${tail(driverLog, 2000)}`,
+      `driver log:\n${tail(app.log, 2000)}`,
   );
   assert.match(
     url,
@@ -283,6 +116,12 @@ test("does not show the startup-failure card", testOptions, () => {
     !rendered.text?.includes(STARTUP_FAILURE),
     `the app showed its startup-failure card: ${JSON.stringify(rendered.text)}`,
   );
+});
+
+test("Object.prototype is frozen (app.security.freezePrototype)", testOptions, async () => {
+  // A library that assigns Object.prototype member names on plain objects
+  // would break the boot under the freeze; the startup-card test catches that.
+  assert.equal(await inPage("return Object.isFrozen(Object.prototype);"), true, "freezePrototype is off");
 });
 
 test("IPC answers config_get with an empty config", testOptions, async () => {
@@ -389,27 +228,47 @@ test("the HTML preview frame renders a page and scrolls to in-page links", testO
   }
 });
 
-test("the Monaco editor worker loads under the CSP", testOptions, async () => {
+test("the editor's styles apply under the CSP, and no worker can start", testOptions, async () => {
+  // CodeMirror (style-mod) mounts its layout styles in a <style> element, and
+  // as constructed style sheets where supported; the app starts no worker
+  // (CSP worker-src 'none'): the constructor throws, or the policy reports
+  // and the worker errors, and its script never runs.
   const result = await inPage(`
     return new Promise((done) => {
-      let violated = null;
-      document.addEventListener("securitypolicyviolation", (event) => { violated = event.violatedDirective; }, { once: true });
-      let worker;
+      const violated = [];
+      const record = (event) => violated.push(event.violatedDirective);
+      document.addEventListener("securitypolicyviolation", record);
+      const probe = document.createElement("div");
+      probe.className = "e2e-style-probe";
+      document.body.append(probe);
+      const sheet = new CSSStyleSheet();
+      sheet.replaceSync(".e2e-style-probe { width: 7px; }");
+      document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+      const style = document.createElement("style");
+      style.textContent = ".e2e-style-probe { height: 9px; }";
+      document.head.append(style);
+      let worker = "silent";
       try {
-        worker = self.MonacoEnvironment.getWorker();
-      } catch (error) {
-        done({ threw: error.name });
-        return;
+        const started = new Worker(URL.createObjectURL(new Blob(["postMessage(1)"], { type: "text/javascript" })));
+        started.addEventListener("error", () => { if (worker === "silent") worker = "blocked"; });
+        started.addEventListener("message", () => { worker = "ran"; });
+      } catch {
+        worker = "blocked";
       }
-      let error = null;
-      worker.addEventListener("error", (event) => { error = event.message || "error"; });
       setTimeout(() => {
-        worker.terminate();
-        done({ error, violated });
+        const box = probe.getBoundingClientRect();
+        probe.remove();
+        style.remove();
+        document.adoptedStyleSheets = document.adoptedStyleSheets.filter((other) => other !== sheet);
+        document.removeEventListener("securitypolicyviolation", record);
+        const styleViolations = violated.filter((directive) => directive.startsWith("style"));
+        const workerReported = violated.some((directive) => directive.startsWith("worker-src") || directive.startsWith("script-src"));
+        if (worker === "silent" && workerReported) worker = "blocked";
+        done({ width: box.width, height: box.height, styleViolations, worker });
       }, 1500);
     });
   `);
-  assert.deepEqual(result, { error: null, violated: null });
+  assert.deepEqual(result, { width: 7, height: 9, styleViolations: [], worker: "blocked" });
 });
 
 test("auth card contains no raw undefined or [object Object]", testOptions, async () => {
@@ -504,6 +363,36 @@ test("page script cannot close or resize the window", testOptions, async () => {
   assert.deepEqual(results, ["denied", "denied", "denied", "allowed", "denied", "allowed"]);
   await new Promise((wait) => setTimeout(wait, 500));
   assert.equal((await session.getAllWindowHandles()).length, handles, "the window was closed");
+  assert.match(await inPage("return location.href;"), APP_ORIGIN);
+});
+
+// Document windows (window.rs, notebook/doc_windows.rs) are built only by Rust,
+// for a document of the unlocked session, through the same guarded builder as
+// the main window. A fresh profile is locked, so none can open here; the
+// page cannot build a window itself, and the document-window commands are
+// not in the main window's capability.
+test("no document window opens while locked or from page script", testOptions, async () => {
+  const handles = (await session.getAllWindowHandles()).length;
+  const results = await inPage(`
+    const attempt = (command, args) => window.__TAURI_INTERNALS__.invoke(command, args).then(
+      () => "allowed",
+      (error) => (error && typeof error === "object" && typeof error.code === "string" ? error.code : "denied"),
+    );
+    return Promise.all([
+      // Granted to the main window, but there is no session to hold a document of.
+      attempt("open_document_window", { documentId: "n-" + "0".repeat(64) }),
+      attempt("plugin:webview|create_webview_window", { options: { label: "doc-e2e", url: "index.html?window=document&id=x" } }),
+      attempt("plugin:window|create", { options: { label: "doc-e2e" } }),
+      attempt("document_window_info", {}),
+      attempt("document_window_close", {}),
+      attempt("document_window_flushed", { request: 1 }),
+      // Only document windows hand a preview link to the main window.
+      attempt("document_link_open", { href: "nb-doc:a.md" }),
+    ]);
+  `);
+  assert.deepEqual(results, ["LOCKED", "denied", "denied", "denied", "denied", "denied", "denied"]);
+  await new Promise((wait) => setTimeout(wait, 500));
+  assert.equal((await session.getAllWindowHandles()).length, handles, "a window was created");
   assert.match(await inPage("return location.href;"), APP_ORIGIN);
 });
 

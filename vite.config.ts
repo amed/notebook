@@ -13,6 +13,7 @@ export default defineConfig({
     target: "esnext",
     minify: "oxc",
     sourcemap: false,
-    chunkSizeWarningLimit: 4_000,
+    // The main chunk is about 735 KB with CodeMirror; a warning means it grew a lot.
+    chunkSizeWarningLimit: 1_000,
   },
 });
