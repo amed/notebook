@@ -269,9 +269,15 @@ body { overscroll-behavior: none; }
 .web-modal .modal { --modal-width: 440px; }
 .web-modal .modal-actions .button { height: 44px; }
 
-/* Phones: big touch targets, smaller margins, no Split */
+/* Phones: big touch targets, smaller margins, no Split. Only the note: no
+   folder path, no Save button (edits save by themselves; the title's dot
+   shows unsaved text) unless a save failed, and only warnings and errors in
+   the status line. */
 @media (max-width: 640px) {
-  .web-split { display: none; }
+  .web-split,
+  .web-crumbs,
+  .web-shell:not(:has(.web-status[data-tone="error"])) .web-save,
+  .web-status[data-tone="info"] { display: none; }
   .web-doc > .preview,
   .web-doc .editor-host { --file-margins: var(--size-4-4); }
   .web-name { font-size: 16px; }

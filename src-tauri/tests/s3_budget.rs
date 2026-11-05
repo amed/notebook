@@ -1374,3 +1374,30 @@ async fn a_document_window_cannot_stage_while_its_document_moves_to_the_trash() 
     let restored = app.restore(&entry).await.unwrap();
     assert_eq!(app.read(&restored).await.unwrap(), "flushed");
 }
+
+#[tokio::test]
+async fn the_last_opened_note_is_reopened_after_the_next_unlock() {
+    let (s3, directory) = seeded().await;
+    let app = s3.workspace(directory.path());
+    app.unlock(PHRASE).await.unwrap();
+    assert_eq!(app.last_document().unwrap(), None, "nothing opened yet");
+    app.open_main("b.md").await.unwrap();
+    app.lock();
+    app.unlock(PHRASE).await.unwrap();
+    assert_eq!(app.last_document().unwrap().as_deref(), Some("b.md"));
+    // config.json holds the encrypted S3 key, never the note's name.
+    let config =
+        std::fs::read_to_string(directory.path().join("config").join("config.json")).unwrap();
+    assert!(config.contains("last_document_key"));
+    assert!(!config.contains("b.md"));
+    // A note that is no longer in the tree is not reopened.
+    app.trash("b.md").await.unwrap();
+    assert_eq!(app.last_document().unwrap(), None);
+    s3.reset_counts();
+    app.open_main("a.md").await.unwrap();
+    assert_eq!(app.last_document().unwrap().as_deref(), Some("a.md"));
+    assert!(
+        !s3.requests().contains(&"PUT"),
+        "remembering never touches S3"
+    );
+}

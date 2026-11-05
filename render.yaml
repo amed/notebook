@@ -1,0 +1,73 @@
+# Render Blueprint: the mobile web version (web/, built into dist-web/) as a
+# static site. Not the root index.html: that is the desktop app's Tauri front
+# end, which in a plain browser is only a demo with sample notes.
+#
+# A static site set up by hand in the Render dashboard needs the same two
+# settings:
+#   Build Command      npm ci && npm run build:web
+#   Publish Directory  dist-web
+#
+# Storage other than AWS S3 (R2, MinIO…): add NOTEBOOK_WEB_CONNECT_SRC with its
+# origin(s) to the service's environment and redeploy (see web/README.md).
+#
+# Headers: the same as web/deploy/_headers. The full Content-Security-Policy is
+# in index.html's <meta> tag; the header adds what a <meta> policy cannot.
+services:
+  - type: web
+    name: notebook
+    runtime: static
+    buildCommand: npm ci && npm run build:web
+    staticPublishPath: ./dist-web
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: no-referrer
+      - path: /*
+        name: Permissions-Policy
+        value: camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=()
+      - path: /*
+        name: Strict-Transport-Security
+        value: max-age=63072000; includeSubDomains
+      - path: /*
+        name: Cross-Origin-Opener-Policy
+        value: same-origin
+      - path: /*
+        name: Cross-Origin-Resource-Policy
+        value: same-origin
+      - path: /
+        name: Content-Security-Policy
+        value: frame-ancestors 'none'
+      - path: /
+        name: X-Frame-Options
+        value: DENY
+      - path: /
+        name: Cache-Control
+        value: no-cache
+      - path: /index.html
+        name: Content-Security-Policy
+        value: frame-ancestors 'none'
+      - path: /index.html
+        name: X-Frame-Options
+        value: DENY
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+      # The HTML preview frame: framed by the app only, nothing in it may load or run.
+      - path: /preview.html
+        name: Content-Security-Policy
+        value: "default-src 'none'; style-src 'unsafe-inline'; img-src data:; media-src data:; font-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'"
+      - path: /preview.html
+        name: X-Frame-Options
+        value: SAMEORIGIN
+      - path: /preview.html
+        name: Cache-Control
+        value: no-cache
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable

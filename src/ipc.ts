@@ -350,6 +350,8 @@ export const ipc = {
     invoke("trash_purge", { entryIds }),
   trashEmpty: async (): Promise<PurgeResult> => invoke("trash_empty"),
 
+  /** The document the main window last opened in the active workspace, if it still exists. */
+  lastDocumentGet: async (): Promise<string | null> => invoke("last_document_get"),
   docOpen: async (id: string, knownRev: string | null = null): Promise<OpenDocument> =>
     invoke("doc_open", { id, knownRev }),
   /** Writes the edit to the encrypted local outbox; no S3 request. `rev`: the text's, as doc_open gives it. */

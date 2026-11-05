@@ -51,6 +51,10 @@ pub(super) struct WorkspaceConfig {
     /// the unlock screen then offers Remember unchecked. Not secret.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) remember_declined: bool,
+    /// The S3 key (ciphertext, never a name) of the document last opened in
+    /// the main window; the next unlock reopens it. Not secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) last_document_key: Option<String>,
 }
 
 impl WorkspaceConfig {
@@ -96,7 +100,7 @@ impl AppConfig {
         self.workspaces.iter().find(|workspace| workspace.id == id)
     }
 
-    fn active(&self) -> Option<&WorkspaceConfig> {
+    pub(super) fn active(&self) -> Option<&WorkspaceConfig> {
         self.get(self.active_workspace.as_deref()?)
     }
 
@@ -221,6 +225,7 @@ fn parse_config(bytes: &[u8]) -> Option<(AppConfig, bool)> {
             // Derived exactly as the old build derived it from the same values.
             legacy_keychain_user: raw.credentials_stored.then(|| keychain_user(&legacy)),
             remember_declined: false,
+            last_document_key: None,
         };
         app.active_workspace = Some(workspace.id.clone());
         app.workspaces.push(workspace);
@@ -1374,6 +1379,7 @@ fn save_workspace(
         masked_access_key_id: None,
         legacy_keychain_user: None,
         remember_declined: false,
+        last_document_key: None,
     });
     workspace.name = name;
     if let Some(remember) = input.remember_phrase {
@@ -1618,6 +1624,7 @@ pub(super) fn add_test_workspace(app: &mut AppConfig, location: VaultConfig) -> 
         masked_access_key_id: None,
         legacy_keychain_user: None,
         remember_declined: false,
+        last_document_key: None,
     });
     app.active_workspace = Some(id.clone());
     id

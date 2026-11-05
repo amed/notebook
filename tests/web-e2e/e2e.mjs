@@ -53,16 +53,31 @@ async function row(page, name) {
   return locator.first();
 }
 
+/** A note's row, expanding its folder only when the row is not already shown (a reopened note expands its folder). */
+async function revealRow(page, folder, name) {
+  const target = page.locator(".web-tree .tree-row", { has: page.locator(".node-label", { hasText: name }) });
+  if (!(await target.first().isVisible())) await (await row(page, folder)).click();
+  return row(page, name);
+}
+
+/** Phones open notes ready to type (like iOS Notes): switch to the preview where a test reads it. */
+async function showPreview(page) {
+  if (await page.locator('.web-doc[data-mode="edit"]').count()) await page.locator(".web-mode").click();
+}
+
 async function openDrawerIfPhone(page, size) {
   if (size.name !== "phone") return;
   if (!(await page.locator(".web-shell.drawer-open").count())) await page.locator(".web-menu").click();
   await page.locator(".web-shell.drawer-open .web-sidebar").waitFor({ state: "visible" });
 }
 
-/** `text` is a substring or a RegExp; "Saved" must be /^Saved$/ ("Unsaved changes" contains it). */
+/**
+ * `text` is a substring or a RegExp; "Saved" must be /^Saved$/ ("Unsaved changes" contains it).
+ * Phones hide routine status ("Saved"), so the text is matched whether shown or not.
+ */
 async function waitStatus(page, text) {
   try {
-    await page.locator(".web-status", { hasText: text }).waitFor({ timeout: 20_000 });
+    await page.locator(".web-status", { hasText: text }).waitFor({ state: "attached", timeout: 20_000 });
   } catch (error) {
     throw new Error(`status "${text}" not shown; it reads "${await page.locator(".web-status").textContent()}"`, { cause: error });
   }
@@ -73,8 +88,7 @@ async function shot(page, label) {
   await page.screenshot({ path: join(SHOTS, `${label}.png`) });
 }
 
-async function fillConnect(page, { name, phrase }) {
-  await page.fill('input[name="name"]', name);
+async function fillConnect(page, { phrase }) {
   await page.fill('input[name="bucket"]', env("E2E_BUCKET"));
   await page.fill('input[name="region"]', "us-east-1");
   await page.fill('input[name="prefix"]', env("E2E_PREFIX"));
@@ -130,18 +144,21 @@ async function run(engineName, size) {
 
   // 2. A wrong phrase is refused before anything is stored.
   if (size.name === "desktop") {
-    await fillConnect(page, { name: `E2E ${label}`, phrase: "certainly not the phrase" });
+    await fillConnect(page, { phrase: "certainly not the phrase" });
     await page.locator(".web-form-error", { hasText: "phrase does not match" }).waitFor({ timeout: 30_000 });
     assert.equal(await page.evaluate(() => localStorage.getItem("notebook.config.v2")), null);
   }
 
   // 3. Connect; the desktop's note is listed.
-  await fillConnect(page, { name: `E2E ${label}`, phrase: env("E2E_PHRASE") });
+  await fillConnect(page, { phrase: env("E2E_PHRASE") });
   await page.locator(".web-shell").waitFor({ timeout: 30_000 });
   await openDrawerIfPhone(page, size);
   await (await row(page, "From desktop")).click();
   await shot(page, `${label}-dark-2-list`);
   await (await row(page, "Desktop note.md")).click();
+  // Phones open notes ready to type (like iOS Notes).
+  if (size.name === "phone") await page.locator('.web-doc[data-mode="edit"] .cm-content').waitFor({ timeout: 20_000 });
+  await showPreview(page);
 
   // 4. Preview: rendered Markdown, the desktop's heading ids, an in-page link.
   const preview = page.locator(".web-doc .preview");
@@ -173,7 +190,9 @@ async function run(engineName, size) {
   await page.locator(".cm-content").click();
   await page.keyboard.press("ControlOrMeta+End");
   await typeLines(page, ["", `Edited on the web (${label}).`]);
-  assert.equal(await page.locator(".web-save").isEnabled(), true, "Save is enabled once edited");
+  // Phones show no Save button (notes save by themselves) and no folder path, only the note.
+  if (size.name === "phone") assert.deepEqual(await page.locator(".web-save, .web-crumbs").evaluateAll((els) => els.map((el) => el.offsetParent !== null)), [false, false]);
+  else assert.equal(await page.locator(".web-save").isEnabled(), true, "Save is enabled once edited");
   await page.keyboard.press("ControlOrMeta+s");
   await waitStatus(page, /^Saved$/);
   expected.documents[DESKTOP_NOTE] = await editorText(page);
@@ -186,10 +205,9 @@ async function run(engineName, size) {
     const other = await context.newPage(); // the same browser profile: it opens the remembered workspace
     await other.goto(WEB);
     await other.locator(".web-shell").waitFor({ timeout: 30_000 });
-    await (await row(other, "From desktop")).click();
-    await (await row(other, "Desktop note.md")).click();
-    await other.locator(".web-mode").click();
-    await other.locator(".cm-content").waitFor({ timeout: 20_000 });
+    // The last note reopens by itself, ready to type (like iOS Notes).
+    await other.locator(".web-name", { hasText: "Desktop note.md" }).waitFor({ timeout: 20_000 });
+    await other.locator('.web-doc[data-mode="edit"] .cm-content').waitFor({ timeout: 20_000 });
     await other.locator(".cm-content").click();
     await other.keyboard.press("ControlOrMeta+End");
     await typeLines(other, ["", `Other tab (${label} ${RUN}).`]);
@@ -228,7 +246,8 @@ async function run(engineName, size) {
   await page.locator(".web-name", { hasText: `Note from ${label}.md` }).waitFor();
   await page.locator(".cm-content").click();
   await typeLines(page, [`# Hello from ${label}`, "", "Some **bold** text, a [[Desktop note]] link and Ünïcödé 名前."]);
-  await page.locator(".web-save").click();
+  // Phones: the pause after typing saves the note; larger screens use the Save button.
+  if (size.name !== "phone") await page.locator(".web-save").click();
   await waitStatus(page, /^Saved$/);
   const notePath = `${folder}/Note from ${label}.md`;
   expected.documents[notePath] = await editorText(page);
@@ -278,14 +297,18 @@ async function run(engineName, size) {
   assert.ok(!JSON.stringify(config).includes(env("E2E_AK")), "the config holds only the masked key id");
   await page.reload();
   await page.locator(".web-shell").waitFor({ timeout: 30_000 });
+  // The last open note reopens by itself: Markdown in the editor, HTML pages in the preview.
+  await page.locator('.web-doc:not([data-mode="none"])').waitFor({ timeout: 20_000 });
+  const reopened = (await page.locator(".web-name").textContent()) ?? "";
+  assert.equal(await page.locator(".web-doc").getAttribute("data-mode"), reopened.endsWith(".html") ? "preview" : "edit", `${label}: the last note reopens ready to type`);
   await openDrawerIfPhone(page, size);
   await row(page, folder);
 
   // Light theme screenshots of the same screens.
   await page.emulateMedia({ colorScheme: "light" });
   await shot(page, `${label}-light-6-list`);
-  await (await row(page, "From desktop")).click();
-  await (await row(page, "Desktop note.md")).click();
+  await (await revealRow(page, "From desktop", "Desktop note.md")).click();
+  await showPreview(page);
   await preview.locator("h1#h-written-by-the-desktop-app").waitFor({ timeout: 20_000 });
   await shot(page, `${label}-light-7-preview`);
   await page.emulateMedia({ colorScheme: "dark" });

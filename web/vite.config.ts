@@ -12,6 +12,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
+import { testS3 } from "./dev/test-s3.ts";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
 const ORIGIN = /^(?:https:\/\/(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*(?::\d{1,5})?|http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?)$/i;
@@ -69,7 +70,8 @@ export default defineConfig({
   publicDir: "public",
   clearScreen: false,
   envPrefix: "NOTEBOOK_WEB_PUBLIC_",
-  plugins: [contentSecurityPolicy()],
+  // testS3: `npm run dev:web` only, an in-memory bucket with sample notes (web/dev/).
+  plugins: [contentSecurityPolicy(), testS3()],
   server: {
     host: "127.0.0.1",
     port: 1430,

@@ -176,3 +176,8 @@ commands.allow = ["document_link_open"]
 identifier = "allow-document-window-flushed"
 description = "Report that the calling document window wrote its pending edit to the outbox."
 commands.allow = ["document_window_flushed"]
+
+[[permission]]
+identifier = "allow-last-document-get"
+description = "Find the document the main window last opened in the active workspace, to reopen it after unlock."
+commands.allow = ["last_document_get"]

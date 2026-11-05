@@ -202,6 +202,8 @@ class App {
   private selected = "d2";
   private expanded = new Set([ROOT, "f1"]);
   private previewMode: PreviewMode = "split";
+  /** Set by an unlock that reopened the last note: it opens in Edit with the cursor in it, like iOS Notes. */
+  private reopenedLast = false;
   /** The writing mode Cmd+Shift+V goes back to from Preview (Edit or Split). */
   private writingMode: WritingMode = "split";
   /** F9: the document alone, without sidebar, header, status bar or outline; the window title is its name. */
@@ -610,7 +612,12 @@ class App {
     if (generation !== this.authGeneration) return false;
     if (snapshot) {
       this.tree.replace(snapshot);
-      this.selected = this.tree.firstDocument() ?? "";
+      const last = await ipc.lastDocumentGet().catch(() => null);
+      if (generation !== this.authGeneration) return false;
+      const node = last ? this.tree.get(last) : undefined;
+      this.selected = node?.id ?? this.tree.firstDocument() ?? "";
+      this.reopenedLast = Boolean(node);
+      if (node && languageForFile(node.name) !== "html") this.previewMode = "edit";
     } else {
       this.docs = sampleDocs();
       this.tree.replace({ nodes: sampleNodes });
@@ -870,7 +877,11 @@ class App {
     this.bindMainEvents();
     this.updateWorkspacePicker();
     this.renderTree();
-    void this.openDocument(this.selected);
+    const reopened = this.reopenedLast;
+    this.reopenedLast = false;
+    void this.openDocument(this.selected).then(() => {
+      if (reopened && this.previewMode !== "preview" && this.documents.openId === this.selected) this.editor?.focus();
+    });
   }
 
   private bindMainEvents(): void {

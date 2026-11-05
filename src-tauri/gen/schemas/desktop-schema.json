@@ -447,6 +447,12 @@
           "markdownDescription": "Validate, encrypt and add image bytes."
         },
         {
+          "description": "Find the document the main window last opened in the active workspace, to reopen it after unlock.",
+          "type": "string",
+          "const": "allow-last-document-get",
+          "markdownDescription": "Find the document the main window last opened in the active workspace, to reopen it after unlock."
+        },
+        {
           "description": "Save the sidebar and outline widths and the Split ratio with the global preferences.",
           "type": "string",
           "const": "allow-layout-set",

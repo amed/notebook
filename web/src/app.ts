@@ -20,11 +20,16 @@ import {
   type AppConfig, defaultName, IndexedDbKeyStore, LocalStore, maskedAccessKeyId, MemoryKeyStore,
   persistentKeysAvailable, type StoredCredentials, type WorkspaceConfig,
 } from "./config.ts";
+import { TEST_NOTEBOOK } from "../dev/test-notebook.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { locationProblem, normalizedPrefix, S3Client, type S3Location } from "./s3.ts";
 import { documentId, documentLanguage, fileName, folderId, parentPath, Vault } from "./vault.ts";
 
 type Mode = "preview" | "edit" | "split";
+/** The last open note per workspace, as its S3 key (ciphertext), never its name. */
+const LAST_NOTE_KEY = "notebook.web.last.v1";
+/** Like iOS Notes: edits are saved after a short pause, and when the app goes to the background. */
+const AUTOSAVE_DELAY_MS = 2500;
 type Child = Node | string | null | undefined | false;
 
 interface OpenDocument {
@@ -111,6 +116,9 @@ export class App {
   private saving: Promise<boolean> | null = null;
   private editorLoading: Promise<void> | null = null;
   private previewTimer: number | undefined;
+  private autosaveTimer: number | undefined;
+  /** The first open after unlock reopens the last note in the editor on every screen size. */
+  private restoring = false;
   private els: {
     shell: HTMLElement; sidebar: HTMLElement; main: HTMLElement; tree: HTMLElement; search: HTMLInputElement;
     title: HTMLElement; crumbs: HTMLElement; docArea: HTMLElement; editorHost: HTMLElement; preview: HTMLElement;
@@ -140,6 +148,9 @@ export class App {
     });
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden" && this.dirty()) void this.save();
+    });
+    window.addEventListener("pagehide", () => {
+      if (this.dirty()) void this.save();
     });
     this.phone.addEventListener("change", () => this.syncDrawer());
     this.wide.addEventListener("change", () => {
@@ -194,7 +205,6 @@ export class App {
 
   private renderConnect(problem = ""): void {
     const inputs = {
-      name: textInput("name", { placeholder: "Defaults to the bucket name", maxlength: "64" }),
       bucket: textInput("bucket", { required: true }),
       region: textInput("region", { value: "eu-central-1", required: true }),
       prefix: textInput("prefix", { placeholder: "Optional, for example notes" }),
@@ -204,11 +214,19 @@ export class App {
       sessionToken: textInput("session-token", { type: "password", placeholder: "Optional", autocomplete: "off" }),
       phrase: textInput("phrase", { type: "password", required: true, autocomplete: "new-password" }),
     };
+    // `npm run dev:web` only: the dev server's test notebook (web/dev/), one tap on Connect away.
+    if (import.meta.env.DEV) {
+      inputs.bucket.value = TEST_NOTEBOOK.bucket;
+      inputs.region.value = TEST_NOTEBOOK.region;
+      inputs.endpoint.value = `${location.origin}${TEST_NOTEBOOK.path}`;
+      inputs.accessKeyId.value = TEST_NOTEBOOK.accessKeyId;
+      inputs.secretAccessKey.value = TEST_NOTEBOOK.secretAccessKey;
+      inputs.phrase.value = TEST_NOTEBOOK.phrase;
+    }
     const remember = h("input", { type: "checkbox", name: "remember", checked: this.persistent, disabled: !this.persistent });
     const error = h("p", { class: "error web-form-error", role: "alert", text: problem });
     const submit = h("button", { type: "submit", class: "button button-primary", text: "Connect" });
     const form = h("form", { class: "form-grid web-connect", novalidate: true },
-      field("Workspace name", inputs.name),
       field("Bucket", inputs.bucket),
       field("Region", inputs.region),
       field("Prefix", inputs.prefix, "optional"),
@@ -230,7 +248,7 @@ export class App {
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       const values: ConnectValues = {
-        name: inputs.name.value, bucket: inputs.bucket.value.trim(), region: inputs.region.value.trim(), prefix: inputs.prefix.value,
+        name: "", bucket: inputs.bucket.value.trim(), region: inputs.region.value.trim(), prefix: inputs.prefix.value,
         endpoint: inputs.endpoint.value.trim(), accessKeyId: inputs.accessKeyId.value.trim(), secretAccessKey: inputs.secretAccessKey.value.trim(),
         sessionToken: inputs.sessionToken.value.trim(), phrase: inputs.phrase.value, remember: remember.checked,
       };
@@ -250,7 +268,6 @@ export class App {
     const remember = h("input", { type: "checkbox", name: "remember", checked: this.persistent && !workspace.remember_declined, disabled: !this.persistent });
     const error = h("p", { class: "error web-form-error", role: "alert", text: problem });
     const submit = h("button", { type: "submit", class: "button button-primary", text: "Unlock" });
-    const other = h("button", { type: "button", class: "button button-ghost", text: "Use another workspace" });
     const forget = h("button", { type: "button", class: "button button-ghost web-danger-text", text: "Forget this device" });
     const needCredentials = !storedCredentials && !this.credentials;
     const remembered = this.store.has(workspace.id, "phrase") && storedCredentials;
@@ -264,7 +281,7 @@ export class App {
       field("Encryption phrase", phrase),
       h("label", { class: "check-field" }, remember, h("span", { text: "Remember on this device" })),
       error,
-      h("div", { class: "auth-actions" }, forget, h("span", { class: "auth-spacer" }), other, submit),
+      h("div", { class: "auth-actions" }, forget, h("span", { class: "auth-spacer" }), submit),
     );
     form.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -284,7 +301,6 @@ export class App {
         }, workspace);
       });
     });
-    other.addEventListener("click", () => this.renderConnect());
     forget.addEventListener("click", () => void this.forgetDevice());
     const location = [workspace.bucket, normalizedPrefix(workspace.prefix)].filter(Boolean).join(" / ");
     this.authScreen(workspace.name, `Unlock ${location}${workspace.endpoint ? ` at ${workspace.endpoint}` : ""}.`, form);
@@ -390,8 +406,38 @@ export class App {
     this.expanded.clear();
     this.buildShell(workspace);
     this.renderTree();
+    const last = this.lastNote(vault, workspace);
+    if (last) {
+      this.setDrawer(false);
+      this.restoring = true;
+      void this.openDocument(documentId(last));
+      return;
+    }
     this.showEmpty();
     this.setDrawer(this.phone.matches);
+  }
+
+  private lastNote(vault: Vault, workspace: WorkspaceConfig): string | undefined {
+    try {
+      const keys = JSON.parse(window.localStorage.getItem(LAST_NOTE_KEY) ?? "{}") as Record<string, unknown>;
+      const key = keys[workspace.id];
+      return typeof key === "string" ? vault.pathOfKey(key) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private rememberNote(path: string): void {
+    const workspace = this.workspace;
+    const key = this.vault?.storedKey(path);
+    if (!workspace || !key) return;
+    try {
+      const keys = JSON.parse(window.localStorage.getItem(LAST_NOTE_KEY) ?? "{}") as Record<string, unknown>;
+      keys[workspace.id] = key;
+      window.localStorage.setItem(LAST_NOTE_KEY, JSON.stringify(keys));
+    } catch {
+      // Storage full or blocked: the next start simply shows the note list.
+    }
   }
 
   private buildShell(workspace: WorkspaceConfig): void {
@@ -652,7 +698,9 @@ export class App {
       this.editor?.close();
       if (this.editor) this.editor.open(id, opened.text, false, language);
       if (mode) this.mode = mode;
+      else if (this.phone.matches || this.restoring) this.mode = language === "html" ? "preview" : "edit";
       else if (this.mode === "split" && !this.wide.matches) this.mode = "preview";
+      this.rememberNote(path);
       this.setStatus("");
       this.renderTitle();
       this.renderTree();
@@ -661,6 +709,8 @@ export class App {
       if (fragment) this.scrollToFragment(fragment);
     } catch (error) {
       this.setStatus(message(error), "error");
+    } finally {
+      this.restoring = false;
     }
   }
 
@@ -692,6 +742,8 @@ export class App {
       if (!this.els || this.editor) return;
       this.editor = new Editor(this.els.editorHost, () => {
         this.updateDirty();
+        window.clearTimeout(this.autosaveTimer);
+        if (this.dirty()) this.autosaveTimer = window.setTimeout(() => void this.save(), AUTOSAVE_DELAY_MS);
         if (this.mode === "split") {
           window.clearTimeout(this.previewTimer);
           this.previewTimer = window.setTimeout(() => this.renderPreview(), 250);
@@ -899,6 +951,7 @@ export class App {
     this.credentials = null;
     this.workspace = null;
     await this.store.forgetDevice();
+    try { window.localStorage.removeItem(LAST_NOTE_KEY); } catch { /* blocked storage: nothing stored */ }
     this.config = this.store.loadConfig();
     this.store = new LocalStore(window.localStorage, this.persistent ? new IndexedDbKeyStore() : new MemoryKeyStore());
     this.renderConnect();

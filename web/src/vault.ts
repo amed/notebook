@@ -197,6 +197,17 @@ export class Vault {
     });
   }
 
+  /** The S3 key (ciphertext) of a stored path, to remember a note without its name. */
+  storedKey(path: string): string | undefined {
+    return this.objects.get(path)?.key;
+  }
+
+  /** The logical path stored under an S3 key, if it is still in the listing. */
+  pathOfKey(key: string): string | undefined {
+    for (const [path, object] of this.objects) if (object.key === key) return path;
+    return undefined;
+  }
+
   /** The logical path of a node id ("folder:a/b" or "doc:a/b.md"); "" for the root. */
   pathOf(id: string): string {
     return this.tree.pathOf(id).slice(1);

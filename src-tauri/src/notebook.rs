@@ -2890,7 +2890,75 @@ pub async fn doc_open(
     id: String,
     known_rev: Option<String>,
 ) -> Result<OpenDocument, IpcError> {
-    open_document_known(&state, &id, window.label(), known_rev.as_deref()).await
+    let opened = open_document_known(&state, &id, window.label(), known_rev.as_deref()).await?;
+    if window.label() == MAIN_WINDOW {
+        remember_last_document(&state, &id);
+    }
+    Ok(opened)
+}
+
+/// Records the S3 key of the document the main window opened, so the next
+/// unlock of this workspace reopens it. Best effort: a failed write only
+/// means the next start opens the first document instead.
+fn remember_last_document(state: &NotebookState, id: &str) {
+    let Ok(mut guard) = state.inner.lock() else {
+        return;
+    };
+    let inner = &mut *guard;
+    let Some(key) = inner.session.as_ref().and_then(|session| {
+        session
+            .nodes
+            .get(id)
+            .filter(|node| node.kind == "Document")
+            .and_then(|node| session.objects.get(&node.logical_path))
+            .map(|object| object.key.clone())
+    }) else {
+        return;
+    };
+    let Some(active) = inner.app.active_workspace.clone() else {
+        return;
+    };
+    let Some(workspace) = inner.app.workspaces.iter_mut().find(|w| w.id == active) else {
+        return;
+    };
+    if workspace.last_document_key.as_deref() == Some(key.as_str()) {
+        return;
+    }
+    workspace.last_document_key = Some(key);
+    let _ = state.save_config(&inner.app);
+}
+
+/// The id of the document the main window last opened in the active
+/// workspace, if it is still in the unlocked tree.
+#[tauri::command]
+pub fn last_document_get(state: State<'_, NotebookState>) -> Result<Option<String>, IpcError> {
+    last_document_id(&state)
+}
+
+fn last_document_id(state: &NotebookState) -> Result<Option<String>, IpcError> {
+    let inner = state
+        .inner
+        .lock()
+        .map_err(|_| IpcError::internal("STATE"))?;
+    let session = inner.session.as_ref().ok_or_else(IpcError::locked)?;
+    let Some(key) = inner
+        .app
+        .active()
+        .and_then(|workspace| workspace.last_document_key.as_deref())
+    else {
+        return Ok(None);
+    };
+    Ok(session
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.kind == "Document")
+        .find(|(_, node)| {
+            session
+                .objects
+                .get(&node.logical_path)
+                .is_some_and(|object| object.key == key)
+        })
+        .map(|(id, _)| id.clone()))
 }
 
 async fn open_document(state: &NotebookState, id: &str) -> Result<OpenDocument, IpcError> {
@@ -4508,6 +4576,7 @@ pub fn configure(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
         trash_purge,
         trash_empty,
         doc_open,
+        last_document_get,
         doc_stage,
         doc_commit,
         flush_all,
@@ -4776,6 +4845,29 @@ pub mod testing {
             open_document(&self.0, &self.id_of(path)?)
                 .await
                 .map(|document| (document.text.unwrap_or_default(), document.dirty))
+        }
+
+        /// `doc_open` from the main window, which also remembers the document
+        /// for the next unlock.
+        pub async fn open_main(&self, path: &str) -> Result<(), IpcError> {
+            let id = self.id_of(path)?;
+            open_document(&self.0, &id).await?;
+            remember_last_document(&self.0, &id);
+            Ok(())
+        }
+
+        /// `last_document_get`, as the logical path of the remembered document.
+        pub fn last_document(&self) -> Result<Option<String>, IpcError> {
+            let Some(id) = last_document_id(&self.0)? else {
+                return Ok(None);
+            };
+            let inner = self
+                .0
+                .inner
+                .lock()
+                .map_err(|_| IpcError::internal("STATE"))?;
+            let session = inner.session.as_ref().ok_or_else(IpcError::locked)?;
+            Ok(session.nodes.get(&id).map(|node| node.logical_path.clone()))
         }
 
         /// `doc_stage`: "Clean" or "Staged", without any S3 request.

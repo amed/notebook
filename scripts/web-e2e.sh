@@ -30,8 +30,10 @@ export DOCKER_CONFIG="$WORK/docker" # empty: no registry credentials are read
 dock() { perl -e 'alarm 90; exec @ARGV' docker "$@"; }
 
 SERVER=""
+MINIO_PID=""
 cleanup() {
   [ -n "$SERVER" ] && kill "$SERVER" 2>/dev/null || true
+  [ -n "$MINIO_PID" ] && kill "$MINIO_PID" 2>/dev/null || true
   dock rm -f "$NAME" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -41,20 +43,40 @@ AK="e2e$(openssl rand -hex 8)"
 SK="$(openssl rand -hex 24)"
 PHRASE="e2e phrase $(openssl rand -hex 6)"
 
-echo "starting MinIO ($IMAGE) on 127.0.0.1:$MINIO_PORT"
-dock run -d --name "$NAME" -p "127.0.0.1:$MINIO_PORT:9000" \
-  -e MINIO_ROOT_USER="$AK" -e MINIO_ROOT_PASSWORD="$SK" \
-  -e MINIO_DEFAULT_BUCKETS="$BUCKET" \
-  -e MINIO_API_CORS_ALLOW_ORIGIN="http://127.0.0.1:$WEB_PORT" \
-  "$IMAGE" >/dev/null
-for _ in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$MINIO_PORT/minio/health/ready" >/dev/null && break
-  sleep 1
-done
-for _ in $(seq 1 30); do
-  dock exec "$NAME" sh -c 'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc ls local/'"$BUCKET" >/dev/null 2>&1 && break
-  sleep 1
-done
+# Docker by default; a native MinIO (MINIO_BIN, or `minio` on PATH, e.g.
+# `brew install minio`) when Docker is not reachable from this account.
+NATIVE="${MINIO_BIN:-}"
+if [ -z "$NATIVE" ] && ! dock info >/dev/null 2>&1; then
+  NATIVE="$(command -v minio || true)"
+  [ -n "$NATIVE" ] || { echo "Docker is not reachable and no minio binary was found (brew install minio)." >&2; exit 1; }
+fi
+if [ -n "$NATIVE" ]; then
+  echo "starting MinIO ($NATIVE) on 127.0.0.1:$MINIO_PORT"
+  MINIO_ROOT_USER="$AK" MINIO_ROOT_PASSWORD="$SK" \
+    MINIO_API_CORS_ALLOW_ORIGIN="http://127.0.0.1:$WEB_PORT" MINIO_BROWSER=off \
+    "$NATIVE" server "$WORK/minio-data" --address "127.0.0.1:$MINIO_PORT" --quiet >"$WORK/minio.log" 2>&1 &
+  MINIO_PID=$!
+  for _ in $(seq 1 60); do
+    curl -sf "http://127.0.0.1:$MINIO_PORT/minio/health/ready" >/dev/null && break
+    sleep 1
+  done
+  curl -sf -X PUT --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK" "http://127.0.0.1:$MINIO_PORT/$BUCKET" >/dev/null
+else
+  echo "starting MinIO ($IMAGE) on 127.0.0.1:$MINIO_PORT"
+  dock run -d --name "$NAME" -p "127.0.0.1:$MINIO_PORT:9000" \
+    -e MINIO_ROOT_USER="$AK" -e MINIO_ROOT_PASSWORD="$SK" \
+    -e MINIO_DEFAULT_BUCKETS="$BUCKET" \
+    -e MINIO_API_CORS_ALLOW_ORIGIN="http://127.0.0.1:$WEB_PORT" \
+    "$IMAGE" >/dev/null
+  for _ in $(seq 1 60); do
+    curl -sf "http://127.0.0.1:$MINIO_PORT/minio/health/ready" >/dev/null && break
+    sleep 1
+  done
+  for _ in $(seq 1 30); do
+    dock exec "$NAME" sh -c 'mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc ls local/'"$BUCKET" >/dev/null 2>&1 && break
+    sleep 1
+  done
+fi
 
 echo "building the site with MinIO in its CSP"
 (cd "$ROOT" && NOTEBOOK_WEB_CONNECT_SRC="http://127.0.0.1:$MINIO_PORT" npx vite build --config web/vite.config.ts --outDir "$WORK/site" --emptyOutDir --logLevel warn)

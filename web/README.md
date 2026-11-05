@@ -16,10 +16,17 @@ links, the navigation guards and the new-file rules). The desktop app's
 
 ```sh
 npm ci
-npm run dev:web        # http://127.0.0.1:1430, live reload
+npm run dev:web        # http://127.0.0.1:1430, live reload, with a test notebook
 npm run build:web      # type-check, then the static site in dist-web/
 npm run preview:web    # serve dist-web/ on http://127.0.0.1:1431
 ```
+
+**Test notebook (dev only).** `npm run dev:web` also serves an in-memory S3
+bucket with sample notes (`web/dev/`), encrypted with the real codec, and the
+connect form comes pre-filled with it: press Connect. Edits last until the dev
+server restarts. To use a real bucket instead, replace the pre-filled values
+(Forget this device brings the form back). None of this is in
+`npm run build:web`.
 
 Size: about 158 KB of JavaScript (54 KB gzipped) and 77 KB of CSS (14 KB)
 to connect, browse and read; the editor (CodeMirror, 552 KB, 192 KB gzipped)
@@ -31,6 +38,11 @@ Copy it to any static host over **HTTPS** (WebCrypto only works in a secure
 context; `localhost` is the exception). Asset paths are relative, so a
 sub-path such as `https://example.com/notes/` works.
 
+- **Render**: `render.yaml` at the repository root is a Blueprint for a
+  static site with the headers of `web/deploy/_headers`. A site set up by hand needs Build Command
+  `npm ci && npm run build:web` and Publish Directory `dist-web` (not
+  `npm run build` / `dist`: that is the desktop app's front end, which in a
+  browser is only a demo with sample notes).
 - **Netlify, Cloudflare Pages**: deploy `dist-web/`. They apply
   `dist-web/_headers`, generated from `web/deploy/_headers` with the same
   Content-Security-Policy as the page's `<meta>` tag plus `frame-ancestors`.
@@ -111,7 +123,7 @@ Temporary credentials (a session token) are accepted.
 
 ## What it does
 
-- **Connect**: workspace name, bucket, region, prefix, optional endpoint,
+- **Connect**: bucket, region, prefix, optional endpoint,
   access key ID, secret, optional session token, encryption phrase,
   "Remember on this device" (on by default). The phrase is checked against the
   workspace before anything is stored: a listing in which nothing decrypts is
@@ -125,9 +137,13 @@ Temporary credentials (a session token) are accepted.
   notes), `.html` documents in the desktop's sandboxed preview frame, `.txt`
   as plain text. External links open in a new tab after a confirmation.
 - **Edit** with the desktop's CodeMirror editor (loaded on first use), Split
-  on screens 1100 px and wider. **Save** with the button, Ctrl+S / ⌘S, and
-  before opening another note, Lock or Forget; the page warns before closing
-  with unsaved changes and tries to save when it is hidden.
+  on screens 1100 px and wider. The last open note reopens by itself, in the
+  editor. Notes save a moment after you stop typing, with the button, Ctrl+S /
+  ⌘S, and before opening another note, Lock or Forget; the page warns before
+  closing with unsaved changes and tries to save when it is hidden.
+- **Phones** show only the open note: the file list is a drawer (☰), and
+  there is no folder path, no Save button (a dot after the title marks unsaved
+  text; the button comes back after a failed save) and no routine status.
 - **New note** (a path from the root; no extension means `.md`; missing
   folders are created) and **New folder** (a Notebook `.notebook_dir` marker).
   Names follow the desktop's rules and get " 2", " 3"… when taken.
